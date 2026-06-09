@@ -216,92 +216,104 @@ def uyap_login(
         except Exception as exc:
             return tool_error(f"Giriş sayfası açılamadı: {exc}")
 
-        # 2. Form alanlarını çıkar
-        hidden = _extract_hidden_fields(r.text)
-        form_action = _extract_form_action(r.text)
-        if not form_action:
-            form_action = f"{_AUTH_BASE}/Giris/Mobil-Imza"
-        elif not form_action.startswith("http"):
-            form_action = urljoin(_AUTH_BASE, form_action)
-
-        # Telefon operatörü → gsmtype eşlemesi
-        # giris.turkiye.gov.tr: 1=Türkcell, 2=Vodafone, 3=Türk Telekom
-        _OPERATOR_MAP = {
-            "turkcell": "1", "türkcell": "1",
-            "vodafone": "2",
-            "turktelekom": "3", "türktelekom": "3", "tt": "3", "ttmobil": "3",
-        }
-        op_hint = (telefon or "").lower().replace(" ", "").replace("-", "")
-        # Türkcell varsayılan
-        gsmtype_val = "1"
-        for op_key, op_val in _OPERATOR_MAP.items():
-            if op_key in op_hint:
+        # Operatör → gsmtype (1=Türkcell, 2=Vodafone, 3=Türk Telekom)
+        _OP_MAP = {"turkcell": "1", "türkcell": "1", "vodafone": "2",
+                   "turktelekom": "3", "türktelekom": "3", "tt": "3"}
+        creds_op = _load_credentials().get("operator", "turkcell").lower()
+        gsmtype_val = _OP_MAP.get(creds_op, "1")
+        # Ayrıca telefon stringinden de tespit et
+        for op_key, op_val in _OP_MAP.items():
+            if op_key in telefon.lower().replace(" ", ""):
                 gsmtype_val = op_val
                 break
 
-        # Dinamik alan adlarını tespit et (önce sayfadan bak, yoksa bilinen değerleri kullan)
-        all_inputs = re.findall(r'name=["\'](\w+)["\']', r.text, re.IGNORECASE)
-        tc_field = next(
-            (n for n in all_inputs if "trid" in n.lower() or "tckn" in n.lower() or
-             n.lower() in {"tcno", "tc_no", "tckimlikno", "username"}),
-            "tridField"
-        )
-        tel_field = next(
-            (n for n in all_inputs if "gsm" in n.lower() or "msisdn" in n.lower() or
-             "telefon" in n.lower() or "phone" in n.lower()),
-            "gsmField"
-        )
+        form_url = _LOGIN_URL
 
-        # 3. Mobil imza isteği gönder
-        post_data = {**hidden, tc_field: tc_no, tel_field: tel, "gsmtype": gsmtype_val}
+        def _get_hidden(html_text: str) -> Dict[str, str]:
+            result: Dict[str, str] = {}
+            for m in re.finditer(
+                r'<input[^>]+type=["\'\s]*hidden["\'\s][^>]*/?>',
+                html_text, re.IGNORECASE
+            ):
+                nm = re.search(r'name=["\']([^"\']+)["\']', m.group(0))
+                vl = re.search(r'value=["\']([^"\']*)["\']', m.group(0))
+                if nm:
+                    result[nm.group(1)] = vl.group(1) if vl else ""
+            return result
+
+        # ADIM 1 → Sözleşme sayfasını al (TC + telefon gönder)
+        hidden1 = _get_hidden(r.text)
         try:
-            r2 = sess.post(
-                form_action,
-                data=post_data,
-                timeout=25,
-                allow_redirects=True,
-            )
+            r2 = sess.post(form_url, data={
+                **hidden1,
+                "tridField": tc_no,
+                "gsmField": tel,
+                "gsmtype": gsmtype_val,
+                "submitButton": "Devam Et",
+            }, timeout=25, allow_redirects=True)
         except Exception as exc:
-            return tool_error(f"Mobil imza isteği gönderilemedi: {exc}")
+            return tool_error(f"Adım1 POST hatası: {exc}")
 
-        # 4. Oturum durumunu kaydet
+        # Hata kontrolü (TC/telefon hatalı vs.)
+        err_m = re.search(
+            r'(?:id|class)=["\'][^"\']*(?:form-error|error-msg|alert-danger)[^"\']*["\'][^>]*>\s*([^<]{5,300})',
+            r2.text, re.IGNORECASE
+        )
+        if err_m:
+            return tool_error(f"Giriş hatası: {err_m.group(1).strip()}")
+
+        # ADIM 2 → Sözleşmeyi onayla (actionName=imzala)
+        hidden2 = _get_hidden(r2.text)
+        if "imzala" not in hidden2.get("actionName", "").lower():
+            # Sayfa beklenmedik bir durumda
+            text_preview = re.sub(r"<[^>]+>", " ", r2.text)
+            text_preview = re.sub(r"\s+", " ", text_preview).strip()[:300]
+            return tool_error(f"Beklenmeyen sayfa adımı. Önizleme: {text_preview}")
+
+        try:
+            r3 = sess.post(form_url, data={
+                **hidden2,
+                "submitButton": "İmzala",
+            }, timeout=30, allow_redirects=True)
+        except Exception as exc:
+            return tool_error(f"Adım2 POST hatası (sözleşme): {exc}")
+
+        # ADIM 3 → İmza isteği gönderildi mi?
+        hidden3 = _get_hidden(r3.text)
+        r3_text_clean = re.sub(r"<[^>]+>", " ", r3.text)
+        r3_text_clean = re.sub(r"\s+", " ", r3_text_clean).strip()
+
+        success_phrases = ["operatörden cevap bekleniyor", "imzabasladi", "bekliyor", "sign request"]
+        basarili = (
+            "imzaBasladi" in hidden3.get("actionName", "")
+            or any(p in r3_text_clean.lower() for p in success_phrases)
+        )
+
+        # Oturum durumunu kaydet
         state_data = {
             "cookies": {c.name: c.value for c in sess.cookies},
-            "form_action": form_action,
-            "hidden_fields": hidden,
+            "form_url": form_url,
+            "hidden3": hidden3,
             "tc_no_masked": tc_no[:3] + "****" + tc_no[-4:],
             "telefon_masked": tel[:3] + "****" + tel[-2:],
             "gsmtype": gsmtype_val,
             "zaman": _ts(),
-            "r2_url": r2.url,
-            "r2_status": r2.status_code,
         }
         _login_state_path().write_text(
             json.dumps(state_data, ensure_ascii=False, indent=2), encoding="utf-8"
         )
 
-        # Yanıt sayfasını analiz et
-        r2_lower = r2.text.lower()
-        # Başarı sinyalleri
-        success_signals = ["bekleniyor", "imzalama", "istek gönderildi", "onaylayınız", "pin"]
-        # Hata sinyalleri (sayfa içinde hata elementi)
-        err_m = re.search(
-            r'(?:id|class)=["\'][^"\']*(?:error|hata|uyar)[^"\']*["\'][^>]*>\s*([^<]{5,200})',
-            r2.text, re.IGNORECASE
-        )
-        bekleme_mesaji = ""
-        if any(s in r2_lower for s in success_signals):
-            bekleme_mesaji = "İmza isteği telefona gönderildi. Lütfen imzalayın."
-        elif err_m:
-            hata = err_m.group(1).strip()
-            return tool_error(f"Giriş hatası: {hata}")
+        if not basarili:
+            return tool_error(
+                f"İmza isteği gönderilemedi. Sayfa: {r3_text_clean[:200]}"
+            )
 
         return json.dumps({
             "durum": "bekleniyor",
-            "mesaj": bekleme_mesaji or "Mobil imza isteği gönderildi. Telefonu kontrol edin.",
+            "mesaj": "Mobil imza isteği Türkcell'e gönderildi. Telefonunuzu kontrol edin.",
             "sonraki_adim": (
-                "Telefona gelen imza isteğini onaylayın, ardından "
-                "uyap_login action='complete' ile oturumu tamamlayın."
+                "Telefona gelen imza isteğini onaylayın, "
+                "ardından uyap_login action='complete' ile oturumu tamamlayın."
             ),
             "istek_zamani": _ts(),
         }, ensure_ascii=False, indent=2)
@@ -328,32 +340,41 @@ def uyap_login(
 
         sess = _make_session()
         # Kayıtlı cookie'leri geri yükle
+        auth_domain = urlparse(_AUTH_BASE).netloc
         for name, value in state.get("cookies", {}).items():
-            sess.cookies.set(name, value, domain=urlparse(_AUTH_BASE).netloc)
+            sess.cookies.set(name, value, domain=auth_domain)
 
-        # Eğer kod yoksa, redirect'i yakalamak için callback URL'yi kontrol et
+        callback_url: Optional[str] = None
+
         if code:
             callback_url = f"{_REDIRECT_URI}?code={code}&state={_OAUTH_STATE}"
         else:
-            # Oturum üzerinden redirect'i bekle / takip et
-            # Son form action'ına tekrar istek at ve redirect'i yakala
+            # İmzalama sonrasını kontrol et: kayıtlı hidden3 ile polling POST
+            hidden3 = state.get("hidden3", {})
+            form_url = state.get("form_url", _LOGIN_URL)
             try:
-                r_poll = sess.get(
-                    state.get("form_action", _LOGIN_URL),
-                    timeout=timeout,
+                r_poll = sess.post(
+                    form_url,
+                    data={**hidden3, "submitButton": "Devam Et"},
+                    timeout=30,
                     allow_redirects=True,
                 )
-                final = r_poll.url
-                if _BILIRKISI_BASE in final:
-                    callback_url = final
-                    parsed_final = urlparse(final)
+                final_url = r_poll.url
+                if _BILIRKISI_BASE in final_url:
+                    callback_url = final_url
+                    parsed_final = urlparse(final_url)
                     qs = parse_qs(parsed_final.query)
                     code = qs.get("code", [None])[0]
+                elif "code=" in final_url:
+                    callback_url = final_url
+                    code = parse_qs(urlparse(final_url).query).get("code", [None])[0]
                 else:
+                    poll_text = re.sub(r"<[^>]+>", " ", r_poll.text)
+                    poll_text = re.sub(r"\s+", " ", poll_text).strip()[:300]
                     return json.dumps({
                         "durum": "bekleniyor",
-                        "mesaj": "İmza henüz tamamlanmadı. Birkaç saniye sonra tekrar deneyin.",
-                        "mevcut_url": final,
+                        "mesaj": "İmza henüz onaylanmadı. Telefonu kontrol edip tekrar deneyin.",
+                        "sayfa_ozeti": poll_text,
                     }, ensure_ascii=False)
             except Exception as exc:
                 return tool_error(f"Oturum kontrol hatası: {exc}")
