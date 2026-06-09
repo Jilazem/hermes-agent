@@ -258,6 +258,21 @@ TOOLSETS = {
         "includes": [],
     },
 
+    "uyap": {
+        "description": (
+            "UYAP / e-Bilirkişi entegrasyon araçları — Android cihaz kontrolü (ADB), "
+            "UYAP REST API sorguları, belge işleme (PDF/XML/CSV) ve "
+            "bilirkişi atama takibi."
+        ),
+        "tools": [
+            "uyap_device_check",
+            "uyap_query",
+            "uyap_document_process",
+            "uyap_bilirkisi_track",
+        ],
+        "includes": []
+    },
+
     "discord": {
         "description": "Discord read and participate tools (fetch messages, search members, create threads)",
         "tools": ["discord"],
