@@ -536,190 +536,140 @@ def uyap_login(
     # ------------------------------------------------------------------
     elif action == "complete":
         import requests
-        from urllib.parse import urlparse, parse_qs, urljoin
+        from urllib.parse import urlparse, parse_qs
 
         # Kaydedilmiş login state'i yükle
         state_file = _login_state_path()
         if not state_file.exists():
-            return tool_error(
-                "Önce action='initiate' ile giriş başlatın."
-            )
+            return tool_error("Önce action='initiate' ile giriş başlatın.")
         state = json.loads(state_file.read_text(encoding="utf-8"))
 
-        # redirect_url'den code çıkar
+        # OAuth kodu doğrudan verilmişse: kısa yoldan oturumu kur
         code = auth_code
         if not code and redirect_url:
-            parsed = urlparse(redirect_url)
-            qs = parse_qs(parsed.query)
+            qs = parse_qs(urlparse(redirect_url).query)
             code = qs.get("code", [None])[0]
 
         sess = _make_session()
-        # Kayıtlı cookie'leri geri yükle
         auth_domain = urlparse(_AUTH_BASE).netloc
         for name, value in state.get("cookies", {}).items():
             sess.cookies.set(name, value, domain=auth_domain)
 
-        callback_url: Optional[str] = None
+        _BASE_URL   = f"{_AUTH_BASE}/Giris/Mobil-Imza"
+        _AJAX1      = f"{_AUTH_BASE}/Giris/Mobil-Imza?actionName=ajaximzaBaslangicKontrol"
+        _AJAX2      = f"{_AUTH_BASE}/Giris/Mobil-Imza?actionName=ajaximzaKontrol"
+        _form_ref   = state.get("form_url", _LOGIN_URL)
+        _post_hdrs  = {
+            "Content-Type": "application/x-www-form-urlencoded",
+            "Referer": _form_ref,
+            "Origin": _AUTH_BASE,
+        }
 
         if code:
-            callback_url = f"{_REDIRECT_URI}?code={code}&state={_OAUTH_STATE}"
-        else:
-            # AJAX polling endpoint ile imzalanma durumunu kontrol et
-            _AJAX_POLL_URL = f"{_AUTH_BASE}/Giris/Mobil-Imza?actionName=ajaximzaBaslangicKontrol"
-            form_url = state.get("form_url", _LOGIN_URL)
-            hidden3 = state.get("hidden3", {})
-
-            deadline = time.monotonic() + min(timeout, 60)
-            result_code = 0
-            poll_response = None
-
-            while time.monotonic() < deadline:
-                try:
-                    r_ajax = sess.get(_AJAX_POLL_URL, timeout=8)
-                    try:
-                        ajax_data = r_ajax.json()
-                        result_code = ajax_data.get("resultCode", -1)
-                        poll_response = ajax_data
-                    except Exception:
-                        # JSON değilse ham yanıtı sakla
-                        poll_response = {"raw": r_ajax.text[:500], "status": r_ajax.status_code}
-                        result_code = -1
-                except Exception as exc:
-                    poll_response = {"hata": str(exc)}
-                    result_code = -1
-
-                if result_code != 0:
-                    break
-                time.sleep(3)
-
-            if result_code == 0:
-                return json.dumps({
-                    "durum": "bekleniyor",
-                    "mesaj": "İmza henüz onaylanmadı. Telefonu kontrol edip tekrar deneyin.",
-                    "ajax_yanit": poll_response,
-                }, ensure_ascii=False)
-
-            # AJAX yanıtında doğrudan redirect URL var mı?
-            if isinstance(poll_response, dict):
-                direct_url = (poll_response.get("url") or poll_response.get("redirectUrl")
-                              or poll_response.get("redirect") or "")
-                if direct_url and ("code=" in direct_url or _BILIRKISI_BASE in direct_url):
-                    callback_url = direct_url
-                    code = parse_qs(urlparse(direct_url).query).get("code", [None])[0]
-
-            # Yoksa form submit ile OAuth kodu almayı dene
-            if not callback_url:
-                try:
-                    # Önce yeni sayfayı GET ile al — güncel hidden field'ları için
-                    r_refresh = sess.get(form_url, timeout=15, allow_redirects=True)
-                    if _BILIRKISI_BASE in r_refresh.url:
-                        callback_url = r_refresh.url
-                    else:
-                        # Güncel hidden field'ları çek
-                        def _get_hidden_local(html_text: str) -> Dict[str, str]:
-                            result: Dict[str, str] = {}
-                            for m in re.finditer(
-                                r'<input[^>]+type=["\'\s]*hidden["\'\s][^>]*/?>',
-                                html_text, re.IGNORECASE
-                            ):
-                                nm = re.search(r'name=["\']([^"\']+)["\']', m.group(0))
-                                vl = re.search(r'value=["\']([^"\']*)["\']', m.group(0))
-                                if nm:
-                                    result[nm.group(1)] = vl.group(1) if vl else ""
-                            return result
-
-                        fresh_hidden = _get_hidden_local(r_refresh.text)
-                        submit_data = {**hidden3, **fresh_hidden}
-                        if not submit_data.get("submitButton"):
-                            submit_data["submitButton"] = "Devam Et"
-
-                        r_poll = sess.post(
-                            form_url,
-                            data=submit_data,
-                            timeout=30,
-                            allow_redirects=True,
-                        )
-                        final_url = r_poll.url
-                        if _BILIRKISI_BASE in final_url:
-                            callback_url = final_url
-                            parsed_final = urlparse(final_url)
-                            qs = parse_qs(parsed_final.query)
-                            code = qs.get("code", [None])[0]
-                        elif "code=" in final_url:
-                            callback_url = final_url
-                            code = parse_qs(urlparse(final_url).query).get("code", [None])[0]
-                        else:
-                            poll_text = re.sub(r"<[^>]+>", " ", r_poll.text)
-                            poll_text = re.sub(r"\s+", " ", poll_text).strip()[:400]
-                            return json.dumps({
-                                "durum": "hata",
-                                "mesaj": (
-                                    "İmzalama tamamlandı ama OAuth redirect alınamadı. "
-                                    "Telefondaki tarayıcıdan USB debugging ile cookie alın."
-                                ),
-                                "result_code": result_code,
-                                "ajax_yanit": poll_response,
-                                "submit_data": list(submit_data.keys()),
-                                "son_url": final_url,
-                                "sayfa_ozeti": poll_text,
-                            }, ensure_ascii=False)
-                except Exception as exc:
-                    return tool_error(f"Oturum kontrol hatası: {exc}")
-
-        # UYAP callback URL'sini çağır — UYAP oturumu kur
-        try:
-            r_uyap = sess.get(
-                callback_url,
-                timeout=30,
-                allow_redirects=True,
+            # OAuth kodu zaten var — doğrudan callback'e git
+            r_cb = sess.get(
+                f"{_REDIRECT_URI}?code={code}&state={_OAUTH_STATE}",
+                timeout=30, allow_redirects=True,
             )
-        except Exception as exc:
-            return tool_error(f"UYAP oturum hatası: {exc}")
+            if _BILIRKISI_BASE in r_cb.url:
+                ck = {c.name: c.value for c in sess.cookies}
+                _save_session({"cookies": ck, "base_url": _BILIRKISI_BASE,
+                               "giris_zamani": _ts(), "auth_code": code})
+                state_file.unlink(missing_ok=True)
+                return json.dumps({"durum": "basarili", "son_url": r_cb.url,
+                                   "cookie_sayisi": len(ck)}, ensure_ascii=False, indent=2)
+            return tool_error(f"Callback başarısız: {r_cb.url}")
 
-        # Oturumu kaydet
-        uyap_cookies = {
-            c.name: c.value
-            for c in sess.cookies
-            if _BILIRKISI_BASE.replace("https://", "") in (c.domain or "")
-               or c.domain == ""
-        }
-        if not uyap_cookies:
-            uyap_cookies = {c.name: c.value for c in sess.cookies}
+        # ── FAZ 1: ajaximzaBaslangicKontrol — rc=3 (HASHPAGE) bekle ──
+        # rc=0 → henüz Türkcell'e ulaşmadı
+        # rc=3 → signing request telefona gitti → FAZ 1 tamamlanmış sayılır
+        # rc=2 → hata (rate limit, zaman aşımı)
+        faz1_deadline = time.monotonic() + min(timeout, 30)
+        rc1, rd1 = 0, {}
+        while time.monotonic() < faz1_deadline:
+            try:
+                rd1 = sess.get(_AJAX1, timeout=6).json()
+                rc1 = rd1.get("resultCode", -1)
+            except Exception:
+                rc1 = -1
+            if rc1 != 0:
+                break
+            time.sleep(3)
 
-        session_data = {
-            "cookies": uyap_cookies,
-            "base_url": _BILIRKISI_BASE,
-            "auth_code": code,
-            "son_url": r_uyap.url,
-            "giris_zamani": _ts(),
-            "http_kodu": r_uyap.status_code,
-        }
-        _save_session(session_data)
+        if rc1 == 0:
+            return json.dumps({
+                "durum": "bekleniyor",
+                "mesaj": "Mobil imza isteği Türkcell'e henüz ulaşmadı. Biraz bekleyip tekrar deneyin.",
+                "ajax1": rd1,
+            }, ensure_ascii=False)
 
-        # Başarı/başarısızlık tespiti
-        basarili = (
-            r_uyap.status_code < 400
-            and _BILIRKISI_BASE in r_uyap.url
-            and "hata" not in r_uyap.url.lower()
-        )
+        if rc1 == 2:
+            return json.dumps({
+                "durum": "hata_faz1",
+                "mesaj": "Türkcell imza isteğini reddetti (hız sınırı veya çakışma). "
+                         "Birkaç dakika bekleyip yeniden initiate yapın.",
+                "ajax1": rd1,
+            }, ensure_ascii=False)
 
-        if basarili:
-            # Login state dosyasını temizle
+        # rc1=3 (HASHPAGE): form submit → hash bekleme sayfasına geç
+        rh = sess.post(_BASE_URL, data={"actionName": "imzaBasladi"},
+                       timeout=20, allow_redirects=True, headers=_post_hdrs)
+        hash_hidden = _extract_hidden_fields(rh.text)
+        hash_ref    = rh.url
+
+        # ── FAZ 2: ajaximzaKontrol — kullanıcı PIN girene kadar bekle ──
+        # rc=0 veya rc=3 → henüz imzalanmadı (beklemeye devam)
+        # rc=1 → başarılı imza
+        # rc=2 → hata / iptal
+        faz2_deadline = time.monotonic() + max(timeout - 30, 60)
+        rc2, rd2 = 3, {}
+        while time.monotonic() < faz2_deadline:
+            try:
+                rd2 = sess.get(_AJAX2, timeout=6).json()
+                rc2 = rd2.get("resultCode", -1)
+            except Exception:
+                rc2 = 3  # JSON değilse bekle
+            if rc2 not in (0, 3):
+                break
+            time.sleep(3)
+
+        if rc2 in (0, 3):
+            return json.dumps({
+                "durum": "bekleniyor",
+                "mesaj": "İmza süresi doldu. Telefonda imza isteği görüyorsanız daha hızlı onaylayın.",
+                "ajax2": rd2,
+            }, ensure_ascii=False)
+
+        # rc2=1 (başarı) veya rc2=2 (hata) → final form submit
+        # hash_hidden'da actionName=mobilimzagiris var
+        _ph = {**hash_hidden}
+        rfinal = sess.post(_BASE_URL, data=_ph, timeout=30, allow_redirects=True,
+                           headers={**_post_hdrs, "Referer": hash_ref})
+
+        if _BILIRKISI_BASE in rfinal.url:
+            ck = {c.name: c.value for c in sess.cookies}
+            _save_session({"cookies": ck, "base_url": _BILIRKISI_BASE,
+                           "giris_zamani": _ts(), "faz2_rc": rc2})
             state_file.unlink(missing_ok=True)
             return json.dumps({
                 "durum": "basarili",
                 "mesaj": "UYAP e-Bilirkişi oturumu başarıyla kuruldu.",
-                "son_url": r_uyap.url,
-                "cookie_sayisi": len(uyap_cookies),
-                "giris_zamani": session_data["giris_zamani"],
+                "son_url": rfinal.url,
+                "cookie_sayisi": len(ck),
+                "giris_zamani": _ts(),
             }, ensure_ascii=False, indent=2)
-        else:
-            return json.dumps({
-                "durum": "hata",
-                "mesaj": "Oturum kurulamadı. İmzalandı mı? Tekrar deneyin.",
-                "http_kodu": r_uyap.status_code,
-                "son_url": r_uyap.url,
-            }, ensure_ascii=False)
+
+        # Başarısız — hata detayını dön
+        txt = re.sub(r"<[^>]+>", " ", rfinal.text)
+        txt = re.sub(r"\s+", " ", txt).strip()[:300]
+        return json.dumps({
+            "durum": "hata_faz2",
+            "mesaj": "İmzalama tamamlandı ama UYAP oturumu kurulamadı.",
+            "faz2_rc": rc2,
+            "son_url": rfinal.url,
+            "hash_hidden": hash_hidden,
+            "sayfa_ozeti": txt,
+        }, ensure_ascii=False)
 
     # ------------------------------------------------------------------
     elif action == "status":
