@@ -165,6 +165,147 @@ def _extract_form_action(html_text: str, fallback: str = "") -> str:
 
 
 # ---------------------------------------------------------------------------
+# 0. uyap_browser_login  —  Playwright ile gerçek tarayıcı kontrolü
+# ---------------------------------------------------------------------------
+
+def uyap_browser_login(timeout: int = 120) -> str:
+    """
+    Playwright headless Chromium ile UYAP e-Bilirkişi giriş akışını yürütür.
+    TC no ve telefon kayıtlı kimlik bilgilerinden okunur.
+    Kullanıcı telefonda imzaladıktan sonra tüm cookie'ler (HttpOnly dahil) kaydedilir.
+    """
+    try:
+        from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
+    except ImportError:
+        return tool_error("Playwright kurulu değil. 'pip install playwright && playwright install chromium' çalıştırın.")
+
+    creds = _load_credentials()
+    tc_no = creds.get("tc_no", "")
+    telefon = creds.get("telefon", "")
+    operator = creds.get("operator", "turkcell").lower()
+
+    if not tc_no or not telefon:
+        return tool_error("Kimlik bilgileri eksik (~/.hermes/uyap_credentials.json).")
+
+    tel = re.sub(r"[^0-9]", "", telefon)
+    if tel.startswith("90"): tel = tel[2:]
+    if tel.startswith("0"): tel = tel[1:]
+
+    _OP_MAP = {"turkcell": "1", "türkcell": "1", "vodafone": "2",
+               "turktelekom": "3", "türktelekom": "3", "tt": "3"}
+    gsmtype_val = _OP_MAP.get(operator, "1")
+
+    with sync_playwright() as pw:
+        browser = pw.chromium.launch(
+            headless=True,
+            args=[
+                "--no-sandbox",
+                "--disable-dev-shm-usage",
+                "--ignore-certificate-errors",
+                "--ignore-ssl-errors",
+            ],
+        )
+        ctx = browser.new_context(
+            user_agent=(
+                "Mozilla/5.0 (Linux; Android 13; SM-G991B) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/120.0.0.0 Mobile Safari/537.36"
+            ),
+            locale="tr-TR",
+            ignore_https_errors=True,
+        )
+        page = ctx.new_page()
+
+        try:
+            # 1. Giriş sayfasını aç
+            page.goto(_LOGIN_URL, timeout=20_000, wait_until="domcontentloaded")
+
+            # 2. TC No, telefon, operatör gir
+            page.fill('input[name="tridField"]', tc_no)
+            page.fill('input[name="gsmField"]', tel)
+            page.check(f'input[name="gsmtype"][value="{gsmtype_val}"]')
+
+            # 3. "Devam Et" submit butonu (button[name="submitButton"])
+            page.click('button[name="submitButton"]')
+            page.wait_for_load_state("domcontentloaded", timeout=10_000)
+
+            # 4. Sözleşme/imzala sayfası — "İmzala" butonuna bas
+            try:
+                page.click('button[value="İmzala"]', timeout=8_000)
+                page.wait_for_load_state("domcontentloaded", timeout=10_000)
+            except PWTimeout:
+                pass  # Belki doğrudan imzaBasladi'ye geçti
+
+            # 5. imzaBasladi sayfasındayız — kullanıcı telefonda imzalayana kadar bekle
+            # Playwright otomatik olarak yönlendirmeyi takip eder
+            final_url = page.url
+            try:
+                page.wait_for_url(
+                    f"**bilirkisi.uyap.gov.tr**",
+                    timeout=timeout * 1000,
+                )
+                final_url = page.url
+            except PWTimeout:
+                # Timeout: imzalanmadı, mevcut URL'yi kaydet
+                final_url = page.url
+
+            # 6. Tüm cookie'leri topla (HttpOnly dahil)
+            all_cookies = ctx.cookies()
+            bilirkisi_cookies = {
+                c["name"]: c["value"]
+                for c in all_cookies
+                if "bilirkisi.uyap.gov.tr" in c.get("domain", "")
+                   or "bilirkisi" in c.get("domain", "")
+            }
+            # Bilirkişi cookie'si yoksa tüm cookie'leri al
+            if not bilirkisi_cookies:
+                bilirkisi_cookies = {c["name"]: c["value"] for c in all_cookies}
+
+            # localStorage'dan Adalet Auth token'ı al
+            adalet_auth = ""
+            try:
+                adalet_auth = page.evaluate("localStorage.getItem('AdaletAuth') || ''")
+            except Exception:
+                pass
+
+        finally:
+            browser.close()
+
+    oturum_basarili = _BILIRKISI_BASE in (final_url or "")
+
+    if not oturum_basarili:
+        return json.dumps({
+            "durum": "imza_bekleniyor",
+            "mesaj": (
+                "İmza isteği gönderildi. Telefonunuzu kontrol edin ve Türkcell imzasını onaylayın."
+                " Onayladıktan sonra tekrar uyap_browser_login çağırın."
+            ),
+            "son_url": final_url,
+            "cookie_sayisi": len(bilirkisi_cookies),
+        }, ensure_ascii=False, indent=2)
+
+    session_data: Dict[str, Any] = {
+        "cookies": bilirkisi_cookies,
+        "base_url": _BILIRKISI_BASE,
+        "giris_zamani": _ts(),
+        "kaynak": "playwright",
+        "son_url": final_url,
+    }
+    if adalet_auth:
+        session_data["adalet_auth"] = adalet_auth
+
+    _save_session(session_data)
+    return json.dumps({
+        "durum": "basarili",
+        "mesaj": "UYAP e-Bilirkişi oturumu kuruldu ve kaydedildi.",
+        "son_url": final_url,
+        "cookie_sayisi": len(bilirkisi_cookies),
+        "adalet_auth_kayitli": bool(adalet_auth),
+        "giris_zamani": session_data["giris_zamani"],
+    }, ensure_ascii=False, indent=2)
+
+
+# ---------------------------------------------------------------------------
 # 1. uyap_login  —  e-Devlet Mobil İmza OAuth2 akışı
 # ---------------------------------------------------------------------------
 
@@ -1089,6 +1230,7 @@ _LOGIN_SCHEMA = {
             },
         },
         "required": ["action"],
+
     },
 }
 
@@ -1258,6 +1400,37 @@ def _check_uyap() -> bool:
 
 
 from tools.registry import registry, tool_error  # noqa: E402
+
+_BROWSER_LOGIN_SCHEMA = {
+    "name": "uyap_browser_login",
+    "description": (
+        "Playwright headless Chromium tarayıcısıyla UYAP e-Bilirkişi portalına giriş yapar. "
+        "Tüm form adımlarını otomatik doldurur, Türkcell'e imza isteği gönderir ve "
+        "telefonda imzalanmasını bekler. HttpOnly cookie'ler dahil tüm oturum bilgilerini "
+        "yakalar ve kaydeder. Kayıtlı kimlik bilgilerini (~/.hermes/uyap_credentials.json) "
+        "kullanır."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "timeout": {
+                "type": "integer",
+                "description": "İmzalama için bekleme süresi (saniye). Varsayılan: 120.",
+                "default": 120,
+            }
+        },
+        "required": []
+    }
+}
+
+registry.register(
+    name="uyap_browser_login",
+    toolset="uyap",
+    schema=_BROWSER_LOGIN_SCHEMA,
+    handler=lambda args, **kw: uyap_browser_login(timeout=args.get("timeout", 120)),
+    check_fn=_check_uyap,
+    emoji="🌐",
+)
 
 registry.register(
     name="uyap_login",
