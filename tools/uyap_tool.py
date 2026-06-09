@@ -202,22 +202,36 @@ def uyap_login(
         elif not form_action.startswith("http"):
             form_action = urljoin(_AUTH_BASE, form_action)
 
-        # Giriş sayfasının TC no ve telefon alanlarını bul
+        # Telefon operatörü → gsmtype eşlemesi
+        # giris.turkiye.gov.tr: 1=Türkcell, 2=Vodafone, 3=Türk Telekom
+        _OPERATOR_MAP = {
+            "turkcell": "1", "türkcell": "1",
+            "vodafone": "2",
+            "turktelekom": "3", "türktelekom": "3", "tt": "3", "ttmobil": "3",
+        }
+        op_hint = (telefon or "").lower().replace(" ", "").replace("-", "")
+        # Türkcell varsayılan
+        gsmtype_val = "1"
+        for op_key, op_val in _OPERATOR_MAP.items():
+            if op_key in op_hint:
+                gsmtype_val = op_val
+                break
+
+        # Dinamik alan adlarını tespit et (önce sayfadan bak, yoksa bilinen değerleri kullan)
+        all_inputs = re.findall(r'name=["\'](\w+)["\']', r.text, re.IGNORECASE)
         tc_field = next(
-            (n for n in ["tckn", "tcKimlikNo", "tc_kimlik_no", "username", "tcNo"]
-             if n.lower() in {k.lower() for k in hidden} or
-             re.search(rf'name=["\']({n})["\']', r.text, re.IGNORECASE)),
-            "tckn"
+            (n for n in all_inputs if "trid" in n.lower() or "tckn" in n.lower() or
+             n.lower() in {"tcno", "tc_no", "tckimlikno", "username"}),
+            "tridField"
         )
         tel_field = next(
-            (n for n in ["msisdn", "telefon", "phoneNumber", "gsm", "cepTelefon"]
-             if n.lower() in {k.lower() for k in hidden} or
-             re.search(rf'name=["\']({n})["\']', r.text, re.IGNORECASE)),
-            "msisdn"
+            (n for n in all_inputs if "gsm" in n.lower() or "msisdn" in n.lower() or
+             "telefon" in n.lower() or "phone" in n.lower()),
+            "gsmField"
         )
 
         # 3. Mobil imza isteği gönder
-        post_data = {**hidden, tc_field: tc_no, tel_field: tel}
+        post_data = {**hidden, tc_field: tc_no, tel_field: tel, "gsmtype": gsmtype_val}
         try:
             r2 = sess.post(
                 form_action,
@@ -228,27 +242,36 @@ def uyap_login(
         except Exception as exc:
             return tool_error(f"Mobil imza isteği gönderilemedi: {exc}")
 
-        # 4. Oturum durumunu kaydet (cookies + state)
+        # 4. Oturum durumunu kaydet
         state_data = {
             "cookies": {c.name: c.value for c in sess.cookies},
             "form_action": form_action,
             "hidden_fields": hidden,
             "tc_no_masked": tc_no[:3] + "****" + tc_no[-4:],
             "telefon_masked": tel[:3] + "****" + tel[-2:],
+            "gsmtype": gsmtype_val,
             "zaman": _ts(),
+            "r2_url": r2.url,
+            "r2_status": r2.status_code,
         }
         _login_state_path().write_text(
             json.dumps(state_data, ensure_ascii=False, indent=2), encoding="utf-8"
         )
 
-        # İmza bekleme sayfasının içeriğinden bilgi al
+        # Yanıt sayfasını analiz et
+        r2_lower = r2.text.lower()
+        # Başarı sinyalleri
+        success_signals = ["bekleniyor", "imzalama", "istek gönderildi", "onaylayınız", "pin"]
+        # Hata sinyalleri (sayfa içinde hata elementi)
+        err_m = re.search(
+            r'(?:id|class)=["\'][^"\']*(?:error|hata|uyar)[^"\']*["\'][^>]*>\s*([^<]{5,200})',
+            r2.text, re.IGNORECASE
+        )
         bekleme_mesaji = ""
-        if "imza" in r2.text.lower() or "bekleniyor" in r2.text.lower():
+        if any(s in r2_lower for s in success_signals):
             bekleme_mesaji = "İmza isteği telefona gönderildi. Lütfen imzalayın."
-        elif "hata" in r2.text.lower() or "error" in r2.text.lower():
-            # Hata mesajını çıkarmaya çalış
-            m = re.search(r'class=["\'](?:error|hata)[^"\']*["\'][^>]*>(.*?)<', r2.text, re.IGNORECASE | re.DOTALL)
-            hata = m.group(1).strip() if m else "Bilinmeyen hata"
+        elif err_m:
+            hata = err_m.group(1).strip()
             return tool_error(f"Giriş hatası: {hata}")
 
         return json.dumps({
