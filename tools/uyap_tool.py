@@ -88,6 +88,20 @@ def _login_state_path() -> Path:
     return _hermes_dir() / "uyap_login_state.json"
 
 
+def _credentials_path() -> Path:
+    return _hermes_dir() / "uyap_credentials.json"
+
+
+def _load_credentials() -> Dict[str, str]:
+    path = _credentials_path()
+    if path.exists():
+        try:
+            return json.loads(path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            pass
+    return {}
+
+
 def _load_session() -> Optional[Dict[str, Any]]:
     path = _session_path()
     if path.exists():
@@ -173,10 +187,18 @@ def uyap_login(
     from urllib.parse import urlparse, parse_qs, urljoin
 
     if action == "initiate":
+        # Kayıtlı kimlik bilgilerini yükle (parametre verilmemişse)
+        creds = _load_credentials()
         if not tc_no:
-            return tool_error("'initiate' için tc_no gerekli.")
+            tc_no = creds.get("tc_no")
         if not telefon:
-            return tool_error("'initiate' için telefon gerekli.")
+            op = creds.get("operator", "")
+            telefon = (creds.get("telefon", "") + (" " + op if op else "")).strip()
+
+        if not tc_no:
+            return tool_error("'initiate' için tc_no gerekli (veya ~/.hermes/uyap_credentials.json kaydedin).")
+        if not telefon:
+            return tool_error("'initiate' için telefon gerekli (veya ~/.hermes/uyap_credentials.json kaydedin).")
 
         # Telefon numarasını normalize et (0 ile başlıyorsa kaldır)
         tel = re.sub(r"[^0-9]", "", telefon)
