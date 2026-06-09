@@ -205,7 +205,7 @@ def uyap_browser_login(phase: str = "start", timeout: int = 90) -> str:
         tel = re.sub(r"[^0-9]", "", telefon)
         if tel.startswith("90"): tel = tel[2:]
         if tel.startswith("0"): tel = tel[1:]
-        _OP_MAP = {"turkcell": "1", "türkcell": "1", "vodafone": "2",
+        _OP_MAP = {"turkcell": "1", "turkcell": "1", "vodafone": "2",
                    "turktelekom": "3", "türktelekom": "3", "tt": "3"}
         gsmtype_val = _OP_MAP.get(operator, "1")
 
@@ -311,7 +311,7 @@ def uyap_browser_login(phase: str = "start", timeout: int = 90) -> str:
         tel = re.sub(r"[^0-9]", "", telefon)
         if tel.startswith("90"): tel = tel[2:]
         if tel.startswith("0"): tel = tel[1:]
-        _OP_MAP = {"turkcell": "1", "türkcell": "1", "vodafone": "2",
+        _OP_MAP = {"turkcell": "1", "turkcell": "1", "vodafone": "2",
                    "turktelekom": "3", "türktelekom": "3", "tt": "3"}
         gsmtype_val = _OP_MAP.get(operator, "1")
 
@@ -482,7 +482,7 @@ def uyap_login(
         if tel.startswith("90"): tel = tel[2:]
         if tel.startswith("0"):  tel = tel[1:]
 
-        _OP_MAP2 = {"turkcell": "1", "türkcell": "1", "vodafone": "2",
+        _OP_MAP2 = {"turkcell": "1", "turkcell": "1", "vodafone": "2",
                     "turktelekom": "3", "türktelekom": "3", "tt": "3"}
         gsmtype_val = _OP_MAP2.get(creds.get("operator", "turkcell").lower(), "1")
 
@@ -536,7 +536,7 @@ def uyap_login(
             txt = re.sub(r"<[^>]+>", " ", r3.text)
             return tool_error(f"İmza başlatılamadı: {re.sub(r' +', ' ', txt).strip()[:250]}")
 
-        # İmza isteği Türkcell'e gitti — kullanıcıyı bilgilendir
+        # İmza isteği Turkcell'e gitti — kullanıcıyı bilgilendir
         import sys
         print(json.dumps({"durum": "imza_istegi_gonderildi",
                           "mesaj": "Telefonunuza imza isteği gönderildi — hemen imzalayın!"},
@@ -557,10 +557,10 @@ def uyap_login(
 
         if rc1 == 0:
             return json.dumps({"durum": "faz1_zaman_asimi",
-                               "mesaj": "İmza isteği Türkcell'e ulaşmadı."}, ensure_ascii=False)
+                               "mesaj": "İmza isteği Turkcell'e ulaşmadı."}, ensure_ascii=False)
         if rc1 == 2:
             return json.dumps({"durum": "hata_faz1",
-                               "mesaj": "Türkcell hata döndürdü (hız sınırı?). Bekleyin.",
+                               "mesaj": "Turkcell hata döndürdü (hız sınırı?). Bekleyin.",
                                "ajax1": rd1}, ensure_ascii=False)
 
         # ── ADIM 4: imzaBasladi gönder → hash bekleme sayfası ──
@@ -648,8 +648,8 @@ def uyap_login(
         except Exception as exc:
             return tool_error(f"Giriş sayfası açılamadı: {exc}")
 
-        # Operatör → gsmtype (1=Türkcell, 2=Vodafone, 3=Türk Telekom)
-        _OP_MAP = {"turkcell": "1", "türkcell": "1", "vodafone": "2",
+        # Operatör → gsmtype (1=Turkcell, 2=Vodafone, 3=Türk Telekom)
+        _OP_MAP = {"turkcell": "1", "turkcell": "1", "vodafone": "2",
                    "turktelekom": "3", "türktelekom": "3", "tt": "3"}
         creds_op = _load_credentials().get("operator", "turkcell").lower()
         gsmtype_val = _OP_MAP.get(creds_op, "1")
@@ -742,7 +742,7 @@ def uyap_login(
 
         return json.dumps({
             "durum": "bekleniyor",
-            "mesaj": "Mobil imza isteği Türkcell'e gönderildi. Telefonunuzu kontrol edin.",
+            "mesaj": "Mobil imza isteği Turkcell'e gönderildi. Telefonunuzu kontrol edin.",
             "sonraki_adim": (
                 "Telefona gelen imza isteğini onaylayın, "
                 "ardından uyap_login action='complete' ile oturumu tamamlayın."
@@ -837,7 +837,7 @@ def uyap_login(
             return tool_error(f"Callback başarısız: {r_cb.url}")
 
         # ── FAZ 1: ajaximzaBaslangicKontrol — rc=3 (HASHPAGE) bekle ──
-        # rc=0 → henüz Türkcell'e ulaşmadı
+        # rc=0 → henüz Turkcell'e ulaşmadı
         # rc=3 → signing request telefona gitti → FAZ 1 tamamlanmış sayılır
         # rc=2 → hata (rate limit, zaman aşımı)
         faz1_deadline = time.monotonic() + min(timeout, 30)
@@ -855,14 +855,14 @@ def uyap_login(
         if rc1 == 0:
             return json.dumps({
                 "durum": "bekleniyor",
-                "mesaj": "Mobil imza isteği Türkcell'e henüz ulaşmadı. Biraz bekleyip tekrar deneyin.",
+                "mesaj": "Mobil imza isteği Turkcell'e henüz ulaşmadı. Biraz bekleyip tekrar deneyin.",
                 "ajax1": rd1,
             }, ensure_ascii=False)
 
         if rc1 == 2:
             return json.dumps({
                 "durum": "hata_faz1",
-                "mesaj": "Türkcell imza isteğini reddetti (hız sınırı veya çakışma). "
+                "mesaj": "Turkcell imza isteğini reddetti (hız sınırı veya çakışma). "
                          "Birkaç dakika bekleyip yeniden initiate yapın.",
                 "ajax1": rd1,
             }, ensure_ascii=False)
@@ -1412,7 +1412,7 @@ _LOGIN_SCHEMA = {
     "description": (
         "e-Devlet Mobil İmza OAuth2 akışıyla UYAP e-Bilirkişi portalına giriş yapar.\n\n"
         "Kullanım:\n"
-        "• action='initiate' → TC no + telefon ile Türkcell imza isteği başlatır\n"
+        "• action='initiate' → TC no + telefon ile Turkcell imza isteği başlatır\n"
         "• action='complete' → imzalama sonrası AJAX polling ile oturumu tamamlar\n"
         "• action='save_cookies' → telefon tarayıcısındaki aktif oturumu kaydeder "
         "(cookies_raw: tarayıcı adres çubuğuna 'javascript:alert(document.cookie)' "
@@ -1434,7 +1434,7 @@ _LOGIN_SCHEMA = {
             },
             "telefon": {
                 "type": "string",
-                "description": "GSM telefon numarası (Türkcell/Vodafone/TT). Sadece 'initiate' için gerekli.",
+                "description": "GSM telefon numarası (Turkcell/Vodafone/TT). Sadece 'initiate' için gerekli.",
             },
             "redirect_url": {
                 "type": "string",
