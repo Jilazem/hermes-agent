@@ -175,6 +175,8 @@ def uyap_login(
     redirect_url: Optional[str] = None,
     auth_code: Optional[str] = None,
     timeout: int = 120,
+    cookies_raw: Optional[str] = None,
+    adalet_auth: Optional[str] = None,
 ) -> str:
     """
     e-Devlet Mobil İmza ile UYAP e-Bilirkişi portalına giriş yapar.
@@ -319,6 +321,45 @@ def uyap_login(
         }, ensure_ascii=False, indent=2)
 
     # ------------------------------------------------------------------
+    elif action == "save_cookies":
+        # Tarayıcı oturumundan cookie'leri doğrudan kaydet
+        # cookies_raw: "JSESSIONID=xxx; TS01234=yyy" formatında ham cookie string
+        cookies_dict: Dict[str, str] = {}
+
+        if cookies_raw:
+            for part in cookies_raw.split(";"):
+                part = part.strip()
+                if "=" in part:
+                    k, v = part.split("=", 1)
+                    cookies_dict[k.strip()] = v.strip()
+        elif adalet_auth:
+            pass  # Sadece token kaydedilecek
+
+        if not cookies_dict and not adalet_auth:
+            return tool_error(
+                "cookies_raw veya adalet_auth parametresi gerekli. "
+                "Tarayıcı adres çubuğuna şunu yazın: javascript:alert(document.cookie)"
+            )
+
+        session_data: Dict[str, Any] = {
+            "cookies": cookies_dict,
+            "base_url": _BILIRKISI_BASE,
+            "giris_zamani": _ts(),
+            "kaynak": "manuel_tarayici",
+        }
+        if adalet_auth:
+            session_data["adalet_auth"] = adalet_auth
+
+        _save_session(session_data)
+        return json.dumps({
+            "durum": "basarili",
+            "mesaj": "Tarayıcı oturum çerezleri kaydedildi. uyap_query ile portala erişebilirsiniz.",
+            "cookie_sayisi": len(cookies_dict),
+            "adalet_auth_kayitli": bool(adalet_auth),
+            "giris_zamani": session_data["giris_zamani"],
+        }, ensure_ascii=False, indent=2)
+
+    # ------------------------------------------------------------------
     elif action == "complete":
         import requests
         from urllib.parse import urlparse, parse_qs, urljoin
@@ -349,9 +390,39 @@ def uyap_login(
         if code:
             callback_url = f"{_REDIRECT_URI}?code={code}&state={_OAUTH_STATE}"
         else:
-            # İmzalama sonrasını kontrol et: kayıtlı hidden3 ile polling POST
-            hidden3 = state.get("hidden3", {})
+            # AJAX polling endpoint ile imzalanma durumunu kontrol et
+            _AJAX_POLL_URL = f"{_AUTH_BASE}/Giris/Mobil-Imza?actionName=ajaximzaBaslangicKontrol"
             form_url = state.get("form_url", _LOGIN_URL)
+            hidden3 = state.get("hidden3", {})
+
+            deadline = time.monotonic() + min(timeout, 30)
+            result_code = 0
+            poll_response = None
+
+            while time.monotonic() < deadline:
+                try:
+                    r_ajax = sess.get(_AJAX_POLL_URL, timeout=8)
+                    try:
+                        ajax_data = r_ajax.json()
+                        result_code = ajax_data.get("resultCode", -1)
+                        poll_response = ajax_data
+                    except Exception:
+                        result_code = -1
+                except Exception:
+                    result_code = -1
+
+                if result_code != 0:
+                    break
+                time.sleep(3)
+
+            if result_code == 0:
+                return json.dumps({
+                    "durum": "bekleniyor",
+                    "mesaj": "İmza henüz onaylanmadı. Telefonu kontrol edip tekrar deneyin.",
+                    "ajax_yanit": poll_response,
+                }, ensure_ascii=False)
+
+            # İmzalandı — form submit ile OAuth kodu al
             try:
                 r_poll = sess.post(
                     form_url,
@@ -372,8 +443,13 @@ def uyap_login(
                     poll_text = re.sub(r"<[^>]+>", " ", r_poll.text)
                     poll_text = re.sub(r"\s+", " ", poll_text).strip()[:300]
                     return json.dumps({
-                        "durum": "bekleniyor",
-                        "mesaj": "İmza henüz onaylanmadı. Telefonu kontrol edip tekrar deneyin.",
+                        "durum": "hata",
+                        "mesaj": (
+                            "İmzalama tamamlandı ama oturum redirect olmadı. "
+                            "Telefondaki tarayıcı oturumunuzu 'save_cookies' ile paylaşın."
+                        ),
+                        "result_code": result_code,
+                        "ajax_yanit": poll_response,
                         "sayfa_ozeti": poll_text,
                     }, ensure_ascii=False)
             except Exception as exc:
@@ -599,13 +675,23 @@ def uyap_query(
 
     sess = _make_session()
     sess_data = _load_session()
+    adalet_auth_token = ""
     if sess_data:
+        adalet_auth_token = sess_data.pop("adalet_auth", "") or ""
         for name, value in sess_data.get("cookies", {}).items():
             sess.cookies.set(name, value)
 
-    headers: Dict[str, str] = {"Accept": "application/json", "Content-Type": "application/json"}
+    headers: Dict[str, str] = {
+        "Accept": "application/json, text/plain, */*",
+        "Content-Type": "application/json",
+        "Cache-Control": "no-cache",
+        "Pragma": "no-cache",
+    }
     if token:
         headers["Authorization"] = f"Bearer {token}"
+    if adalet_auth_token:
+        headers["AdaletAuth"] = adalet_auth_token
+        headers["AdaletAuthAccess"] = adalet_auth_token
 
     try:
         t0 = time.monotonic()
@@ -907,18 +993,22 @@ def uyap_bilirkisi_track(
 _LOGIN_SCHEMA = {
     "name": "uyap_login",
     "description": (
-        "e-Devlet Mobil İmza OAuth2 akışıyla UYAP e-Bilirkişi portalına giriş yapar. "
-        "İki adımlı kullanım:\n"
-        "1. action='initiate' + tc_no + telefon → telefona imza isteği gönderir\n"
-        "2. action='complete' → imzalandıktan sonra oturumu kaydeder\n"
-        "Ek: action='status' oturum durumunu, action='logout' oturumu siler."
+        "e-Devlet Mobil İmza OAuth2 akışıyla UYAP e-Bilirkişi portalına giriş yapar.\n\n"
+        "Kullanım:\n"
+        "• action='initiate' → TC no + telefon ile Türkcell imza isteği başlatır\n"
+        "• action='complete' → imzalama sonrası AJAX polling ile oturumu tamamlar\n"
+        "• action='save_cookies' → telefon tarayıcısındaki aktif oturumu kaydeder "
+        "(cookies_raw: tarayıcı adres çubuğuna 'javascript:alert(document.cookie)' "
+        "yazınca çıkan metni yapıştırın)\n"
+        "• action='status' → mevcut oturum durumunu gösterir\n"
+        "• action='logout' → kaydedilmiş oturumu siler"
     ),
     "parameters": {
         "type": "object",
         "properties": {
             "action": {
                 "type": "string",
-                "enum": ["initiate", "complete", "status", "logout"],
+                "enum": ["initiate", "complete", "save_cookies", "status", "logout"],
                 "description": "Yapılacak işlem.",
             },
             "tc_no": {
@@ -927,7 +1017,7 @@ _LOGIN_SCHEMA = {
             },
             "telefon": {
                 "type": "string",
-                "description": "GSM telefon numarası (Türkcell/Vodafone/Turkcell). Sadece 'initiate' için gerekli.",
+                "description": "GSM telefon numarası (Türkcell/Vodafone/TT). Sadece 'initiate' için gerekli.",
             },
             "redirect_url": {
                 "type": "string",
@@ -938,7 +1028,22 @@ _LOGIN_SCHEMA = {
             },
             "auth_code": {
                 "type": "string",
-                "description": "'complete' için: OAuth2 yetkilendirme kodu (redirect_url yerine doğrudan verilebilir).",
+                "description": "'complete' için: OAuth2 yetkilendirme kodu.",
+            },
+            "cookies_raw": {
+                "type": "string",
+                "description": (
+                    "'save_cookies' için: tarayıcıdan alınan ham cookie dizesi. "
+                    "Chrome'da bilirkisi.uyap.gov.tr açıkken adres çubuğuna "
+                    "'javascript:alert(document.cookie)' yazıp çıkan metni buraya yapıştırın."
+                ),
+            },
+            "adalet_auth": {
+                "type": "string",
+                "description": (
+                    "UYAP Adalet Auth JWT token'ı. "
+                    "Tarayıcı konsolunda: localStorage.getItem('AdaletAuth')"
+                ),
             },
             "timeout": {
                 "type": "integer",
@@ -978,17 +1083,25 @@ _DEVICE_CHECK_SCHEMA = {
 _QUERY_SCHEMA = {
     "name": "uyap_query",
     "description": (
-        "UYAP REST API'sine HTTP isteği gönderir. "
-        "UYAP_API_BASE_URL ve UYAP_API_TOKEN ortam değişkenlerini kullanır. "
-        "Dosya sorgulama, dava bilgisi alma veya belge listesi çekme gibi "
-        "UYAP servislerine erişim sağlar."
+        "UYAP e-Bilirkişi portalına HTTP isteği gönderir (taban: bilirkisi.uyap.gov.tr). "
+        "Kayıtlı oturum çerezlerini otomatik ekler.\n\n"
+        "Bilinen endpoint'ler:\n"
+        "• kullanici_bilgileri.uyap — oturum açmış kullanıcı bilgileri (GET)\n"
+        "• menuListesiGetir.ajx — menü listesi (GET)\n"
+        "• anasayfa.ajx — ana sayfa verileri (GET)\n"
+        "• portal_baslangic.uyap — portal başlangıç (GET ?param=user&value=b&login_type=tm)\n"
+        "• kill_session.uyap — oturum sonlandır (GET)\n"
+        "• islistesiloader — iş listesi sayfasını aç (GET, tarayıcıda açar)"
     ),
     "parameters": {
         "type": "object",
         "properties": {
             "endpoint": {
                 "type": "string",
-                "description": "API yolu, taban URL'ye göre (ör. '/dosya/sorgula', '/bilirkisi/listesi')."
+                "description": (
+                    "API yolu (ör. 'kullanici_bilgileri.uyap', 'menuListesiGetir.ajx'). "
+                    "Başında / olabilir veya olmayabilir."
+                )
             },
             "method": {
                 "type": "string",
@@ -1120,6 +1233,8 @@ registry.register(
         redirect_url=args.get("redirect_url"),
         auth_code=args.get("auth_code"),
         timeout=args.get("timeout", 120),
+        cookies_raw=args.get("cookies_raw"),
+        adalet_auth=args.get("adalet_auth"),
     ),
     check_fn=_check_uyap,
     emoji="🔐",
