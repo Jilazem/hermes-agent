@@ -194,6 +194,113 @@ def uyap_browser_login(phase: str = "start", timeout: int = 90) -> str:
            "Chrome/120.0.0.0 Mobile Safari/537.36")
 
     # ------------------------------------------------------------------
+    if phase == "auto":
+        # Tek Playwright session'da tüm akış: form → imzaBasladi → bekle → cookies kaydet
+        creds = _load_credentials()
+        tc_no = creds.get("tc_no", "")
+        telefon = creds.get("telefon", "")
+        operator = creds.get("operator", "turkcell").lower()
+        if not tc_no or not telefon:
+            return tool_error("Kimlik bilgileri eksik (~/.hermes/uyap_credentials.json).")
+        tel = re.sub(r"[^0-9]", "", telefon)
+        if tel.startswith("90"): tel = tel[2:]
+        if tel.startswith("0"): tel = tel[1:]
+        _OP_MAP = {"turkcell": "1", "türkcell": "1", "vodafone": "2",
+                   "turktelekom": "3", "türktelekom": "3", "tt": "3"}
+        gsmtype_val = _OP_MAP.get(operator, "1")
+
+        with sync_playwright() as pw:
+            browser = pw.chromium.launch(headless=True, args=_LAUNCH_ARGS)
+            ctx = browser.new_context(user_agent=_UA, locale="tr-TR", ignore_https_errors=True)
+            page = ctx.new_page()
+            final_url = ""
+            bilirkisi_cookies: Dict[str, str] = {}
+            adalet_auth = ""
+            try:
+                page.goto(_LOGIN_URL, timeout=20_000, wait_until="domcontentloaded")
+                page.fill('input[name="tridField"]', tc_no)
+                page.fill('input[name="gsmField"]', tel)
+                page.check(f'input[name="gsmtype"][value="{gsmtype_val}"]')
+                page.click('button[name="submitButton"]')
+                page.wait_for_load_state("domcontentloaded", timeout=10_000)
+                try:
+                    page.click('button[value="İmzala"]', timeout=8_000)
+                    page.wait_for_load_state("domcontentloaded", timeout=10_000)
+                except PWTimeout:
+                    pass
+
+                # imzaBasladi sayfasında mıyız?
+                hidden_chk: Dict[str, str] = {}
+                for el in page.query_selector_all('input[type="hidden"]'):
+                    n = el.get_attribute("name") or ""
+                    v = el.get_attribute("value") or ""
+                    if n: hidden_chk[n] = v
+
+                if "imzabasladi" not in hidden_chk.get("actionName", "").lower():
+                    txt = page.inner_text("body")[:200]
+                    return tool_error(f"imzaBasladi sayfasına geçilemedi. Sayfa: {txt}")
+
+                import sys
+                print(json.dumps({
+                    "durum": "imza_istegi_gonderildi",
+                    "mesaj": "Telefonunuza Mobil İmza isteği gönderildi — hemen imzalayın!",
+                }, ensure_ascii=False), flush=True)
+
+                # Tarayıcı açık — e-Devlet JS doğal polling yapıyor
+                # Kullanıcı imzalayınca bilirkisi.uyap.gov.tr'ye yönlenecek
+                page.wait_for_url(f"**{_BILIRKISI_BASE}**", timeout=timeout * 1000)
+                final_url = page.url
+
+                all_cookies = ctx.cookies()
+                bilirkisi_cookies = {
+                    c["name"]: c["value"] for c in all_cookies
+                    if "bilirkisi" in c.get("domain", "")
+                }
+                if not bilirkisi_cookies:
+                    bilirkisi_cookies = {c["name"]: c["value"] for c in all_cookies}
+
+                try:
+                    adalet_auth = page.evaluate("localStorage.getItem('AdaletAuth') || ''")
+                except Exception:
+                    pass
+
+            except PWTimeout:
+                return json.dumps({
+                    "durum": "zaman_asimi",
+                    "mesaj": f"{timeout} saniyede imzalanmadı. Telefonu kontrol edip tekrar deneyin.",
+                    "son_url": page.url,
+                }, ensure_ascii=False)
+            finally:
+                browser.close()
+
+        if _BILIRKISI_BASE not in (final_url or ""):
+            return json.dumps({
+                "durum": "redirect_basarisiz",
+                "mesaj": "İmzalandı ama UYAP portalına yönlendirilemedi.",
+                "son_url": final_url,
+            }, ensure_ascii=False)
+
+        session_data: Dict[str, Any] = {
+            "cookies": bilirkisi_cookies,
+            "base_url": _BILIRKISI_BASE,
+            "giris_zamani": _ts(),
+            "kaynak": "playwright_auto",
+            "son_url": final_url,
+        }
+        if adalet_auth:
+            session_data["adalet_auth"] = adalet_auth
+        _save_session(session_data)
+        _browser_state_path().unlink(missing_ok=True)
+        return json.dumps({
+            "durum": "basarili",
+            "mesaj": "UYAP e-Bilirkişi oturumu başarıyla kuruldu.",
+            "son_url": final_url,
+            "cookie_sayisi": len(bilirkisi_cookies),
+            "adalet_auth_kayitli": bool(adalet_auth),
+            "giris_zamani": session_data["giris_zamani"],
+        }, ensure_ascii=False, indent=2)
+
+    # ------------------------------------------------------------------
     if phase == "start":
         creds = _load_credentials()
         tc_no = creds.get("tc_no", "")
@@ -212,6 +319,9 @@ def uyap_browser_login(phase: str = "start", timeout: int = 90) -> str:
             browser = pw.chromium.launch(headless=True, args=_LAUNCH_ARGS)
             ctx = browser.new_context(user_agent=_UA, locale="tr-TR", ignore_https_errors=True)
             page = ctx.new_page()
+            form_url = _LOGIN_URL
+            hidden: Dict[str, str] = {}
+            all_cookies: list = []
             try:
                 page.goto(_LOGIN_URL, timeout=20_000, wait_until="domcontentloaded")
                 page.fill('input[name="tridField"]', tc_no)
@@ -219,17 +329,13 @@ def uyap_browser_login(phase: str = "start", timeout: int = 90) -> str:
                 page.check(f'input[name="gsmtype"][value="{gsmtype_val}"]')
                 page.click('button[name="submitButton"]')
                 page.wait_for_load_state("domcontentloaded", timeout=10_000)
-                # Sözleşme → İmzala
                 try:
                     page.click('button[value="İmzala"]', timeout=8_000)
                     page.wait_for_load_state("domcontentloaded", timeout=10_000)
                 except PWTimeout:
                     pass
-                # imzaBasladi sayfasındayız — cookie'leri kaydet
                 all_cookies = ctx.cookies()
                 form_url = page.url
-                # Gizli alanları da kaydet
-                hidden: Dict[str, str] = {}
                 for el in page.query_selector_all('input[type="hidden"]'):
                     n = el.get_attribute("name") or ""
                     v = el.get_attribute("value") or ""
@@ -361,6 +467,156 @@ def uyap_login(
     """
     import requests
     from urllib.parse import urlparse, parse_qs, urljoin
+
+    if action == "auto":
+        # Tüm akış TEK session'da: form → Phase1 → Phase2 → redirect
+        creds = _load_credentials()
+        if not tc_no:
+            tc_no = creds.get("tc_no")
+        if not telefon:
+            telefon = creds.get("telefon", "")
+        if not tc_no or not telefon:
+            return tool_error("tc_no/telefon eksik (~/.hermes/uyap_credentials.json).")
+
+        tel = re.sub(r"[^0-9]", "", telefon)
+        if tel.startswith("90"): tel = tel[2:]
+        if tel.startswith("0"):  tel = tel[1:]
+
+        _OP_MAP2 = {"turkcell": "1", "türkcell": "1", "vodafone": "2",
+                    "turktelekom": "3", "türktelekom": "3", "tt": "3"}
+        gsmtype_val = _OP_MAP2.get(creds.get("operator", "turkcell").lower(), "1")
+
+        def _gh(html_text: str) -> Dict[str, str]:
+            result: Dict[str, str] = {}
+            for m in re.finditer(
+                r'<input[^>]+type=["\'\s]*hidden["\'\s][^>]*/?>',
+                html_text, re.IGNORECASE
+            ):
+                nm = re.search(r'name=["\']([^"\']+)["\']', m.group(0))
+                vl = re.search(r'value=["\']([^"\']*)["\']', m.group(0))
+                if nm:
+                    result[nm.group(1)] = vl.group(1) if vl else ""
+            return result
+
+        sess = _make_session()
+        _BU   = f"{_AUTH_BASE}/Giris/Mobil-Imza"
+        _AJ1  = f"{_AUTH_BASE}/Giris/Mobil-Imza?actionName=ajaximzaBaslangicKontrol"
+        _AJ2  = f"{_AUTH_BASE}/Giris/Mobil-Imza?actionName=ajaximzaKontrol"
+        _ph   = {"Content-Type": "application/x-www-form-urlencoded",
+                 "Referer": _LOGIN_URL, "Origin": _AUTH_BASE}
+
+        # ── ADIM 1: giriş sayfası ──
+        try:
+            r = sess.get(_LOGIN_URL, timeout=20); r.raise_for_status()
+        except Exception as exc:
+            return tool_error(f"Giriş sayfası açılamadı: {exc}")
+
+        # ── ADIM 2: TC + telefon gönder ──
+        h1 = _gh(r.text)
+        try:
+            r2 = sess.post(_BU, data={**h1, "tridField": tc_no, "gsmField": tel,
+                                      "gsmtype": gsmtype_val, "submitButton": "Devam Et"},
+                           timeout=25, allow_redirects=True)
+        except Exception as exc:
+            return tool_error(f"Adım1 POST: {exc}")
+
+        # ── ADIM 3: sözleşme onayla ──
+        h2 = _gh(r2.text)
+        if "imzala" not in h2.get("actionName", "").lower():
+            txt = re.sub(r"<[^>]+>", " ", r2.text)
+            return tool_error(f"Sözleşme sayfası bulunamadı: {re.sub(r' +', ' ', txt).strip()[:250]}")
+        try:
+            r3 = sess.post(_BU, data={**h2, "submitButton": "İmzala"},
+                           timeout=30, allow_redirects=True, headers=_ph)
+        except Exception as exc:
+            return tool_error(f"Adım2 POST: {exc}")
+
+        h3 = _gh(r3.text)
+        if "imzabasladi" not in h3.get("actionName", "").lower():
+            txt = re.sub(r"<[^>]+>", " ", r3.text)
+            return tool_error(f"İmza başlatılamadı: {re.sub(r' +', ' ', txt).strip()[:250]}")
+
+        # İmza isteği Türkcell'e gitti — kullanıcıyı bilgilendir
+        import sys
+        print(json.dumps({"durum": "imza_istegi_gonderildi",
+                          "mesaj": "Telefonunuza imza isteği gönderildi — hemen imzalayın!"},
+                         ensure_ascii=False), flush=True)
+
+        # ── FAZ 1: ajaximzaBaslangicKontrol — rc≠0 bekle ──
+        faz1_dl = time.monotonic() + 60
+        rc1, rd1 = 0, {}
+        while time.monotonic() < faz1_dl:
+            try:
+                rd1 = sess.get(_AJ1, timeout=6).json()
+                rc1 = rd1.get("resultCode", -1)
+            except Exception:
+                rc1 = -1
+            if rc1 != 0:
+                break
+            time.sleep(3)
+
+        if rc1 == 0:
+            return json.dumps({"durum": "faz1_zaman_asimi",
+                               "mesaj": "İmza isteği Türkcell'e ulaşmadı."}, ensure_ascii=False)
+        if rc1 == 2:
+            return json.dumps({"durum": "hata_faz1",
+                               "mesaj": "Türkcell hata döndürdü (hız sınırı?). Bekleyin.",
+                               "ajax1": rd1}, ensure_ascii=False)
+
+        # ── ADIM 4: imzaBasladi gönder → hash bekleme sayfası ──
+        rh = sess.post(_BU, data={"actionName": "imzaBasladi"},
+                       timeout=20, allow_redirects=True, headers=_ph)
+        hash_h   = _extract_hidden_fields(rh.text)
+        hash_ref = rh.url
+
+        # ── FAZ 2: ajaximzaKontrol — kullanıcı imzalayana kadar bekle ──
+        faz2_dl = time.monotonic() + max(timeout - 70, 60)
+        rc2, rd2 = 3, {}
+        while time.monotonic() < faz2_dl:
+            try:
+                rd2 = sess.get(_AJ2, timeout=6).json()
+                rc2 = rd2.get("resultCode", -1)
+            except Exception:
+                rc2 = 3
+            if rc2 not in (0, 3):
+                break
+            time.sleep(3)
+
+        if rc2 in (0, 3):
+            return json.dumps({"durum": "faz2_zaman_asimi",
+                               "mesaj": "İmza süresi doldu. Daha hızlı imzalayın.",
+                               "ajax2": rd2}, ensure_ascii=False)
+
+        if rc2 == 2:
+            return json.dumps({"durum": "hata_imzalanmadi",
+                               "mesaj": "İmza reddedildi veya iptal edildi.",
+                               "ajax2": rd2}, ensure_ascii=False)
+
+        # ── ADIM 5: final form submit → bilirkisi.uyap.gov.tr'ye yönlen ──
+        rfinal = sess.post(_BU, data=hash_h, timeout=30, allow_redirects=True,
+                           headers={**_ph, "Referer": hash_ref})
+
+        if _BILIRKISI_BASE in (rfinal.url or ""):
+            ck = {c.name: c.value for c in sess.cookies}
+            _save_session({"cookies": ck, "base_url": _BILIRKISI_BASE,
+                           "giris_zamani": _ts(), "faz2_rc": rc2})
+            return json.dumps({
+                "durum": "basarili",
+                "mesaj": "UYAP e-Bilirkişi oturumu başarıyla kuruldu.",
+                "son_url": rfinal.url,
+                "cookie_sayisi": len(ck),
+                "giris_zamani": _ts(),
+            }, ensure_ascii=False, indent=2)
+
+        txt = re.sub(r"<[^>]+>", " ", rfinal.text)
+        txt = re.sub(r"\s+", " ", txt).strip()[:300]
+        return json.dumps({
+            "durum": "hata_redirect",
+            "mesaj": "İmzalandı ama portal yönlendirmesi başarısız.",
+            "son_url": rfinal.url,
+            "faz2_rc": rc2,
+            "sayfa_ozeti": txt,
+        }, ensure_ascii=False)
 
     if action == "initiate":
         # Kayıtlı kimlik bilgilerini yükle (parametre verilmemişse)
@@ -1169,8 +1425,8 @@ _LOGIN_SCHEMA = {
         "properties": {
             "action": {
                 "type": "string",
-                "enum": ["initiate", "complete", "save_cookies", "status", "logout"],
-                "description": "Yapılacak işlem.",
+                "enum": ["auto", "initiate", "complete", "save_cookies", "status", "logout"],
+                "description": "Yapılacak işlem. 'auto' önerilir: tek çağrıyla tüm akışı yapar.",
             },
             "tc_no": {
                 "type": "string",
@@ -1398,9 +1654,9 @@ _BROWSER_LOGIN_SCHEMA = {
         "properties": {
             "phase": {
                 "type": "string",
-                "enum": ["start", "complete"],
-                "description": "start: imza isteği gönder. complete: imzaladıktan sonra oturumu bitir.",
-                "default": "start",
+                "enum": ["auto", "start", "complete"],
+                "description": "auto: tek çağrıda tüm akışı yapar (önerilen). start: sadece imza isteği gönder. complete: imzaladıktan sonra oturumu bitir.",
+                "default": "auto",
             },
             "timeout": {
                 "type": "integer",
