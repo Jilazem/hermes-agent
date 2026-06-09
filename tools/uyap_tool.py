@@ -3,25 +3,67 @@
 UYAP / e-Bilirkişi Entegrasyon Araçları
 
 Türkiye Adalet Bakanlığı Ulusal Yargı Ağı Projesi (UYAP) entegrasyonu için
-dört araç sağlar:
+beş araç sağlar:
 
-  1. uyap_device_check    — ADB üzerinden mobil cihazda UYAP uygulamalarını kontrol eder
-  2. uyap_query           — UYAP REST API'sine istek gönderir
-  3. uyap_document_process— UYAP belgelerini işler / metni çıkarır / özetler
-  4. uyap_bilirkisi_track — Bilirkişi atamalarını yerel depoda takip eder
+  1. uyap_login           — e-Devlet Mobil İmza OAuth2 akışıyla UYAP'a giriş yapar
+  2. uyap_device_check    — ADB üzerinden mobil cihazda UYAP uygulamalarını kontrol eder
+  3. uyap_query           — UYAP REST API'sine istek gönderir (oturum cookie'leriyle)
+  4. uyap_document_process— UYAP belgelerini işler / metni çıkarır / özetler
+  5. uyap_bilirkisi_track — Bilirkişi atamalarını yerel depoda takip eder
+
+OAuth2 Akışı (uyap_login):
+  action="initiate"  — TC no ve telefon ile mobil imza isteği başlatır
+  action="complete"  — İmzalama sonrası oturumu tamamlar ve kaydeder
 
 Ortam Değişkenleri:
-  UYAP_API_BASE_URL  — UYAP servis taban URL'si (ör. https://vatandas.uyap.gov.tr)
-  UYAP_API_TOKEN     — Yetkilendirme token'ı (Bearer)
+  UYAP_API_BASE_URL  — UYAP servis taban URL'si (varsayılan: https://bilirkisi.uyap.gov.tr)
+  UYAP_API_TOKEN     — (isteğe bağlı) Bearer token; yoksa oturum cookie'leri kullanılır
 """
 
+import html
 import json
 import os
+import re
 import subprocess
 import time
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+
+
+# ---------------------------------------------------------------------------
+# UYAP / e-Devlet OAuth2 Sabitleri
+# ---------------------------------------------------------------------------
+
+_OAUTH_CLIENT_ID  = "74dba0a0-ef79-11e5-a837-0800200c9a66"
+_OAUTH_STATE      = "1527"
+_AUTH_BASE        = "https://giris.turkiye.gov.tr"
+_BILIRKISI_BASE   = "https://bilirkisi.uyap.gov.tr"
+_REDIRECT_URI     = f"{_BILIRKISI_BASE}/login.uyap"
+
+_LOGIN_URL = (
+    f"{_AUTH_BASE}/Giris/Mobil-Imza"
+    f"?oauthClientId={_OAUTH_CLIENT_ID}"
+    "&continue=" + (
+        "https%3A%2F%2Fgiris.turkiye.gov.tr%2FOAuth2AuthorizationServer"
+        "%2FAuthorizationController%3Fresponse_type%3Dcode%26scope%3D"
+        "Kimlik-Dogrula%253BAd-Soyad%26redirect_uri%3D"
+        "https%253A%252F%252Fbilirkisi.uyap.gov.tr%252Flogin.uyap"
+        f"%26client_id%3D{_OAUTH_CLIENT_ID}"
+        f"%26state%3D{_OAUTH_STATE}%26loginTypeIndex%3D2"
+    )
+)
+
+_DEFAULT_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Linux; Android 13; SM-G991B) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/120.0.0.0 Mobile Safari/537.36"
+    ),
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "tr-TR,tr;q=0.9,en;q=0.8",
+    "Accept-Encoding": "gzip, deflate, br",
+}
 
 
 # ---------------------------------------------------------------------------
@@ -32,10 +74,38 @@ def _ts() -> str:
     return datetime.now().isoformat(timespec="seconds")
 
 
-def _bilirkisi_store_path() -> Path:
+def _hermes_dir() -> Path:
     base = Path(os.environ.get("HERMES_DATA_DIR", Path.home() / ".hermes"))
     base.mkdir(parents=True, exist_ok=True)
-    return base / "uyap_bilirkisi.json"
+    return base
+
+
+def _session_path() -> Path:
+    return _hermes_dir() / "uyap_session.json"
+
+
+def _login_state_path() -> Path:
+    return _hermes_dir() / "uyap_login_state.json"
+
+
+def _load_session() -> Optional[Dict[str, Any]]:
+    path = _session_path()
+    if path.exists():
+        try:
+            return json.loads(path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            pass
+    return None
+
+
+def _save_session(data: Dict[str, Any]) -> None:
+    _session_path().write_text(
+        json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+
+
+def _bilirkisi_store_path() -> Path:
+    return _hermes_dir() / "uyap_bilirkisi.json"
 
 
 def _load_bilirkisi_store() -> Dict[str, Any]:
@@ -55,8 +125,272 @@ def _save_bilirkisi_store(store: Dict[str, Any]) -> None:
     )
 
 
+def _make_session():
+    """Oturum cookie jar'ı ve özel başlıkları olan requests.Session döndürür."""
+    import requests
+    s = requests.Session()
+    s.headers.update(_DEFAULT_HEADERS)
+    return s
+
+
+def _extract_hidden_fields(html_text: str) -> Dict[str, str]:
+    """HTML formundaki gizli alanları çıkarır."""
+    return {
+        m.group(1): html.unescape(m.group(2))
+        for m in re.finditer(
+            r'<input[^>]+type=["\']hidden["\'][^>]+name=["\']([^"\']+)["\'][^>]+value=["\']([^"\']*)["\']',
+            html_text, re.IGNORECASE
+        )
+    }
+
+
+def _extract_form_action(html_text: str, fallback: str = "") -> str:
+    """HTML formunun action URL'sini çıkarır."""
+    m = re.search(r'<form[^>]+action=["\']([^"\']+)["\']', html_text, re.IGNORECASE)
+    return html.unescape(m.group(1)) if m else fallback
+
+
 # ---------------------------------------------------------------------------
-# 1. uyap_device_check
+# 1. uyap_login  —  e-Devlet Mobil İmza OAuth2 akışı
+# ---------------------------------------------------------------------------
+
+def uyap_login(
+    action: str = "initiate",
+    tc_no: Optional[str] = None,
+    telefon: Optional[str] = None,
+    redirect_url: Optional[str] = None,
+    auth_code: Optional[str] = None,
+    timeout: int = 120,
+) -> str:
+    """
+    e-Devlet Mobil İmza ile UYAP e-Bilirkişi portalına giriş yapar.
+
+    İki adımlı akış:
+      action="initiate"  — Mobil imza isteği başlatır (telefona imza gelir)
+      action="complete"  — İmzalama tamamlandıktan sonra oturumu kaydeder
+    """
+    import requests
+    from urllib.parse import urlparse, parse_qs, urljoin
+
+    if action == "initiate":
+        if not tc_no:
+            return tool_error("'initiate' için tc_no gerekli.")
+        if not telefon:
+            return tool_error("'initiate' için telefon gerekli.")
+
+        # Telefon numarasını normalize et (0 ile başlıyorsa kaldır)
+        tel = re.sub(r"[^0-9]", "", telefon)
+        if tel.startswith("90"):
+            tel = tel[2:]
+        if tel.startswith("0"):
+            tel = tel[1:]  # 5XXXXXXXXX formatına getir
+
+        sess = _make_session()
+
+        # 1. Giriş sayfasını al — oturum çerezi ve CSRF token için
+        try:
+            r = sess.get(_LOGIN_URL, timeout=20)
+            r.raise_for_status()
+        except Exception as exc:
+            return tool_error(f"Giriş sayfası açılamadı: {exc}")
+
+        # 2. Form alanlarını çıkar
+        hidden = _extract_hidden_fields(r.text)
+        form_action = _extract_form_action(r.text)
+        if not form_action:
+            form_action = f"{_AUTH_BASE}/Giris/Mobil-Imza"
+        elif not form_action.startswith("http"):
+            form_action = urljoin(_AUTH_BASE, form_action)
+
+        # Giriş sayfasının TC no ve telefon alanlarını bul
+        tc_field = next(
+            (n for n in ["tckn", "tcKimlikNo", "tc_kimlik_no", "username", "tcNo"]
+             if n.lower() in {k.lower() for k in hidden} or
+             re.search(rf'name=["\']({n})["\']', r.text, re.IGNORECASE)),
+            "tckn"
+        )
+        tel_field = next(
+            (n for n in ["msisdn", "telefon", "phoneNumber", "gsm", "cepTelefon"]
+             if n.lower() in {k.lower() for k in hidden} or
+             re.search(rf'name=["\']({n})["\']', r.text, re.IGNORECASE)),
+            "msisdn"
+        )
+
+        # 3. Mobil imza isteği gönder
+        post_data = {**hidden, tc_field: tc_no, tel_field: tel}
+        try:
+            r2 = sess.post(
+                form_action,
+                data=post_data,
+                timeout=25,
+                allow_redirects=True,
+            )
+        except Exception as exc:
+            return tool_error(f"Mobil imza isteği gönderilemedi: {exc}")
+
+        # 4. Oturum durumunu kaydet (cookies + state)
+        state_data = {
+            "cookies": {c.name: c.value for c in sess.cookies},
+            "form_action": form_action,
+            "hidden_fields": hidden,
+            "tc_no_masked": tc_no[:3] + "****" + tc_no[-4:],
+            "telefon_masked": tel[:3] + "****" + tel[-2:],
+            "zaman": _ts(),
+        }
+        _login_state_path().write_text(
+            json.dumps(state_data, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+
+        # İmza bekleme sayfasının içeriğinden bilgi al
+        bekleme_mesaji = ""
+        if "imza" in r2.text.lower() or "bekleniyor" in r2.text.lower():
+            bekleme_mesaji = "İmza isteği telefona gönderildi. Lütfen imzalayın."
+        elif "hata" in r2.text.lower() or "error" in r2.text.lower():
+            # Hata mesajını çıkarmaya çalış
+            m = re.search(r'class=["\'](?:error|hata)[^"\']*["\'][^>]*>(.*?)<', r2.text, re.IGNORECASE | re.DOTALL)
+            hata = m.group(1).strip() if m else "Bilinmeyen hata"
+            return tool_error(f"Giriş hatası: {hata}")
+
+        return json.dumps({
+            "durum": "bekleniyor",
+            "mesaj": bekleme_mesaji or "Mobil imza isteği gönderildi. Telefonu kontrol edin.",
+            "sonraki_adim": (
+                "Telefona gelen imza isteğini onaylayın, ardından "
+                "uyap_login action='complete' ile oturumu tamamlayın."
+            ),
+            "istek_zamani": _ts(),
+        }, ensure_ascii=False, indent=2)
+
+    # ------------------------------------------------------------------
+    elif action == "complete":
+        import requests
+        from urllib.parse import urlparse, parse_qs, urljoin
+
+        # Kaydedilmiş login state'i yükle
+        state_file = _login_state_path()
+        if not state_file.exists():
+            return tool_error(
+                "Önce action='initiate' ile giriş başlatın."
+            )
+        state = json.loads(state_file.read_text(encoding="utf-8"))
+
+        # redirect_url'den code çıkar
+        code = auth_code
+        if not code and redirect_url:
+            parsed = urlparse(redirect_url)
+            qs = parse_qs(parsed.query)
+            code = qs.get("code", [None])[0]
+
+        sess = _make_session()
+        # Kayıtlı cookie'leri geri yükle
+        for name, value in state.get("cookies", {}).items():
+            sess.cookies.set(name, value, domain=urlparse(_AUTH_BASE).netloc)
+
+        # Eğer kod yoksa, redirect'i yakalamak için callback URL'yi kontrol et
+        if code:
+            callback_url = f"{_REDIRECT_URI}?code={code}&state={_OAUTH_STATE}"
+        else:
+            # Oturum üzerinden redirect'i bekle / takip et
+            # Son form action'ına tekrar istek at ve redirect'i yakala
+            try:
+                r_poll = sess.get(
+                    state.get("form_action", _LOGIN_URL),
+                    timeout=timeout,
+                    allow_redirects=True,
+                )
+                final = r_poll.url
+                if _BILIRKISI_BASE in final:
+                    callback_url = final
+                    parsed_final = urlparse(final)
+                    qs = parse_qs(parsed_final.query)
+                    code = qs.get("code", [None])[0]
+                else:
+                    return json.dumps({
+                        "durum": "bekleniyor",
+                        "mesaj": "İmza henüz tamamlanmadı. Birkaç saniye sonra tekrar deneyin.",
+                        "mevcut_url": final,
+                    }, ensure_ascii=False)
+            except Exception as exc:
+                return tool_error(f"Oturum kontrol hatası: {exc}")
+
+        # UYAP callback URL'sini çağır — UYAP oturumu kur
+        try:
+            r_uyap = sess.get(
+                callback_url,
+                timeout=30,
+                allow_redirects=True,
+            )
+        except Exception as exc:
+            return tool_error(f"UYAP oturum hatası: {exc}")
+
+        # Oturumu kaydet
+        uyap_cookies = {
+            c.name: c.value
+            for c in sess.cookies
+            if _BILIRKISI_BASE.replace("https://", "") in (c.domain or "")
+               or c.domain == ""
+        }
+        if not uyap_cookies:
+            uyap_cookies = {c.name: c.value for c in sess.cookies}
+
+        session_data = {
+            "cookies": uyap_cookies,
+            "base_url": _BILIRKISI_BASE,
+            "auth_code": code,
+            "son_url": r_uyap.url,
+            "giris_zamani": _ts(),
+            "http_kodu": r_uyap.status_code,
+        }
+        _save_session(session_data)
+
+        # Başarı/başarısızlık tespiti
+        basarili = (
+            r_uyap.status_code < 400
+            and _BILIRKISI_BASE in r_uyap.url
+            and "hata" not in r_uyap.url.lower()
+        )
+
+        if basarili:
+            # Login state dosyasını temizle
+            state_file.unlink(missing_ok=True)
+            return json.dumps({
+                "durum": "basarili",
+                "mesaj": "UYAP e-Bilirkişi oturumu başarıyla kuruldu.",
+                "son_url": r_uyap.url,
+                "cookie_sayisi": len(uyap_cookies),
+                "giris_zamani": session_data["giris_zamani"],
+            }, ensure_ascii=False, indent=2)
+        else:
+            return json.dumps({
+                "durum": "hata",
+                "mesaj": "Oturum kurulamadı. İmzalandı mı? Tekrar deneyin.",
+                "http_kodu": r_uyap.status_code,
+                "son_url": r_uyap.url,
+            }, ensure_ascii=False)
+
+    # ------------------------------------------------------------------
+    elif action == "status":
+        sess_data = _load_session()
+        if not sess_data:
+            return json.dumps({"durum": "oturum_yok", "mesaj": "Aktif UYAP oturumu yok."})
+        return json.dumps({
+            "durum": "aktif",
+            "giris_zamani": sess_data.get("giris_zamani"),
+            "base_url": sess_data.get("base_url"),
+            "cookie_sayisi": len(sess_data.get("cookies", {})),
+        }, ensure_ascii=False, indent=2)
+
+    # ------------------------------------------------------------------
+    elif action == "logout":
+        _session_path().unlink(missing_ok=True)
+        _login_state_path().unlink(missing_ok=True)
+        return json.dumps({"durum": "basarili", "mesaj": "Oturum silindi."}, ensure_ascii=False)
+
+    return tool_error(f"Bilinmeyen action: '{action}'. Geçerliler: initiate, complete, status, logout")
+
+
+# ---------------------------------------------------------------------------
+# 2. uyap_device_check
 # ---------------------------------------------------------------------------
 
 UYAP_PAKETLER = {
@@ -179,7 +513,7 @@ def uyap_device_check(
 
 
 # ---------------------------------------------------------------------------
-# 2. uyap_query
+# 3. uyap_query
 # ---------------------------------------------------------------------------
 
 def uyap_query(
@@ -188,76 +522,60 @@ def uyap_query(
     params: Optional[Dict[str, Any]] = None,
     timeout: int = 30,
 ) -> str:
-    """UYAP REST API'sine istek gönderir."""
+    """UYAP REST API'sine HTTP isteği gönderir. Kayıtlı oturumu kullanır."""
+    import requests as _req
 
-    base_url = os.environ.get("UYAP_API_BASE_URL", "").rstrip("/")
+    base_url = os.environ.get("UYAP_API_BASE_URL", _BILIRKISI_BASE).rstrip("/")
     token = os.environ.get("UYAP_API_TOKEN", "")
-
-    if not base_url:
-        return tool_error(
-            "UYAP_API_BASE_URL ortam değişkeni tanımlı değil. "
-            "Örnek: export UYAP_API_BASE_URL=https://vatandas.uyap.gov.tr"
-        )
-
-    try:
-        import urllib.request
-        import urllib.parse
-        import urllib.error
-    except ImportError:
-        return tool_error("urllib modülü bulunamadı.")
 
     url = f"{base_url}/{endpoint.lstrip('/')}"
     method = method.upper()
 
-    headers = {
-        "Accept": "application/json",
-        "Content-Type": "application/json",
-        "User-Agent": "hermes-agent/uyap-integration",
-    }
+    sess = _make_session()
+    sess_data = _load_session()
+    if sess_data:
+        for name, value in sess_data.get("cookies", {}).items():
+            sess.cookies.set(name, value)
+
+    headers: Dict[str, str] = {"Accept": "application/json", "Content-Type": "application/json"}
     if token:
         headers["Authorization"] = f"Bearer {token}"
 
-    body: Optional[bytes] = None
-    if method == "GET" and params:
-        qs = urllib.parse.urlencode(params)
-        url = f"{url}?{qs}"
-    elif params:
-        body = json.dumps(params, ensure_ascii=False).encode("utf-8")
-
-    req = urllib.request.Request(url, data=body, headers=headers, method=method)
-
     try:
         t0 = time.monotonic()
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            elapsed = round(time.monotonic() - t0, 3)
-            raw = resp.read().decode("utf-8", errors="replace")
-            try:
-                data = json.loads(raw)
-            except json.JSONDecodeError:
-                data = raw
+        if method == "GET":
+            resp = sess.get(url, params=params, headers=headers, timeout=timeout)
+        else:
+            resp = sess.request(method, url, json=params, headers=headers, timeout=timeout)
+        elapsed = round(time.monotonic() - t0, 3)
 
+        if resp.status_code in (401, 403) or (resp.url and "giris" in resp.url.lower()):
             return json.dumps({
-                "durum": "basarili",
-                "http_kodu": resp.status,
-                "sure_sn": elapsed,
-                "url": url,
-                "yontem": method,
-                "veri": data,
-            }, ensure_ascii=False, indent=2)
+                "durum": "oturum_suresi_doldu",
+                "mesaj": "UYAP oturumu sona erdi. uyap_login action='initiate' ile tekrar giriş yapın.",
+                "http_kodu": resp.status_code,
+            }, ensure_ascii=False)
 
-    except urllib.error.HTTPError as exc:
-        body_text = exc.read().decode("utf-8", errors="replace") if exc.fp else ""
+        try:
+            veri = resp.json()
+        except Exception:
+            veri = resp.text[:10_000]
+
         return json.dumps({
-            "durum": "hata",
-            "http_kodu": exc.code,
-            "mesaj": str(exc.reason),
-            "url": url,
-            "yanit": body_text[:2000],
-        }, ensure_ascii=False)
-    except urllib.error.URLError as exc:
-        return tool_error(f"Bağlantı hatası ({url}): {exc.reason}")
-    except TimeoutError:
+            "durum": "basarili",
+            "http_kodu": resp.status_code,
+            "sure_sn": elapsed,
+            "url": resp.url,
+            "yontem": method,
+            "veri": veri,
+        }, ensure_ascii=False, indent=2)
+
+    except _req.exceptions.ConnectionError as exc:
+        return tool_error(f"Bağlantı hatası ({url}): {exc}")
+    except _req.exceptions.Timeout:
         return tool_error(f"Zaman aşımı ({timeout}s): {url}")
+    except Exception as exc:
+        return tool_error(f"İstek hatası: {exc}")
 
 
 # ---------------------------------------------------------------------------
@@ -520,6 +838,52 @@ def uyap_bilirkisi_track(
 # Şemalar
 # ---------------------------------------------------------------------------
 
+_LOGIN_SCHEMA = {
+    "name": "uyap_login",
+    "description": (
+        "e-Devlet Mobil İmza OAuth2 akışıyla UYAP e-Bilirkişi portalına giriş yapar. "
+        "İki adımlı kullanım:\n"
+        "1. action='initiate' + tc_no + telefon → telefona imza isteği gönderir\n"
+        "2. action='complete' → imzalandıktan sonra oturumu kaydeder\n"
+        "Ek: action='status' oturum durumunu, action='logout' oturumu siler."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "action": {
+                "type": "string",
+                "enum": ["initiate", "complete", "status", "logout"],
+                "description": "Yapılacak işlem.",
+            },
+            "tc_no": {
+                "type": "string",
+                "description": "TC kimlik numarası (11 hane). Sadece 'initiate' için gerekli.",
+            },
+            "telefon": {
+                "type": "string",
+                "description": "GSM telefon numarası (Türkcell/Vodafone/Turkcell). Sadece 'initiate' için gerekli.",
+            },
+            "redirect_url": {
+                "type": "string",
+                "description": (
+                    "'complete' için: imzalama sonrası yönlendirilen URL "
+                    "(ör. https://bilirkisi.uyap.gov.tr/login.uyap?code=...)."
+                ),
+            },
+            "auth_code": {
+                "type": "string",
+                "description": "'complete' için: OAuth2 yetkilendirme kodu (redirect_url yerine doğrudan verilebilir).",
+            },
+            "timeout": {
+                "type": "integer",
+                "description": "Saniye cinsinden bekleme süresi. Varsayılan: 120.",
+                "default": 120,
+            },
+        },
+        "required": ["action"],
+    },
+}
+
 _DEVICE_CHECK_SCHEMA = {
     "name": "uyap_device_check",
     "description": (
@@ -678,6 +1042,22 @@ def _check_uyap() -> bool:
 
 
 from tools.registry import registry, tool_error  # noqa: E402
+
+registry.register(
+    name="uyap_login",
+    toolset="uyap",
+    schema=_LOGIN_SCHEMA,
+    handler=lambda args, **kw: uyap_login(
+        action=args.get("action", "initiate"),
+        tc_no=args.get("tc_no"),
+        telefon=args.get("telefon"),
+        redirect_url=args.get("redirect_url"),
+        auth_code=args.get("auth_code"),
+        timeout=args.get("timeout", 120),
+    ),
+    check_fn=_check_uyap,
+    emoji="🔐",
+)
 
 registry.register(
     name="uyap_device_check",

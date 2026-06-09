@@ -265,6 +265,7 @@ TOOLSETS = {
             "bilirkişi atama takibi."
         ),
         "tools": [
+            "uyap_login",
             "uyap_device_check",
             "uyap_query",
             "uyap_document_process",
