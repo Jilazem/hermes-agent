@@ -395,7 +395,7 @@ def uyap_login(
             form_url = state.get("form_url", _LOGIN_URL)
             hidden3 = state.get("hidden3", {})
 
-            deadline = time.monotonic() + min(timeout, 30)
+            deadline = time.monotonic() + min(timeout, 60)
             result_code = 0
             poll_response = None
 
@@ -407,8 +407,11 @@ def uyap_login(
                         result_code = ajax_data.get("resultCode", -1)
                         poll_response = ajax_data
                     except Exception:
+                        # JSON değilse ham yanıtı sakla
+                        poll_response = {"raw": r_ajax.text[:500], "status": r_ajax.status_code}
                         result_code = -1
-                except Exception:
+                except Exception as exc:
+                    poll_response = {"hata": str(exc)}
                     result_code = -1
 
                 if result_code != 0:
@@ -422,38 +425,72 @@ def uyap_login(
                     "ajax_yanit": poll_response,
                 }, ensure_ascii=False)
 
-            # İmzalandı — form submit ile OAuth kodu al
-            try:
-                r_poll = sess.post(
-                    form_url,
-                    data={**hidden3, "submitButton": "Devam Et"},
-                    timeout=30,
-                    allow_redirects=True,
-                )
-                final_url = r_poll.url
-                if _BILIRKISI_BASE in final_url:
-                    callback_url = final_url
-                    parsed_final = urlparse(final_url)
-                    qs = parse_qs(parsed_final.query)
-                    code = qs.get("code", [None])[0]
-                elif "code=" in final_url:
-                    callback_url = final_url
-                    code = parse_qs(urlparse(final_url).query).get("code", [None])[0]
-                else:
-                    poll_text = re.sub(r"<[^>]+>", " ", r_poll.text)
-                    poll_text = re.sub(r"\s+", " ", poll_text).strip()[:300]
-                    return json.dumps({
-                        "durum": "hata",
-                        "mesaj": (
-                            "İmzalama tamamlandı ama oturum redirect olmadı. "
-                            "Telefondaki tarayıcı oturumunuzu 'save_cookies' ile paylaşın."
-                        ),
-                        "result_code": result_code,
-                        "ajax_yanit": poll_response,
-                        "sayfa_ozeti": poll_text,
-                    }, ensure_ascii=False)
-            except Exception as exc:
-                return tool_error(f"Oturum kontrol hatası: {exc}")
+            # AJAX yanıtında doğrudan redirect URL var mı?
+            if isinstance(poll_response, dict):
+                direct_url = (poll_response.get("url") or poll_response.get("redirectUrl")
+                              or poll_response.get("redirect") or "")
+                if direct_url and ("code=" in direct_url or _BILIRKISI_BASE in direct_url):
+                    callback_url = direct_url
+                    code = parse_qs(urlparse(direct_url).query).get("code", [None])[0]
+
+            # Yoksa form submit ile OAuth kodu almayı dene
+            if not callback_url:
+                try:
+                    # Önce yeni sayfayı GET ile al — güncel hidden field'ları için
+                    r_refresh = sess.get(form_url, timeout=15, allow_redirects=True)
+                    if _BILIRKISI_BASE in r_refresh.url:
+                        callback_url = r_refresh.url
+                    else:
+                        # Güncel hidden field'ları çek
+                        def _get_hidden_local(html_text: str) -> Dict[str, str]:
+                            result: Dict[str, str] = {}
+                            for m in re.finditer(
+                                r'<input[^>]+type=["\'\s]*hidden["\'\s][^>]*/?>',
+                                html_text, re.IGNORECASE
+                            ):
+                                nm = re.search(r'name=["\']([^"\']+)["\']', m.group(0))
+                                vl = re.search(r'value=["\']([^"\']*)["\']', m.group(0))
+                                if nm:
+                                    result[nm.group(1)] = vl.group(1) if vl else ""
+                            return result
+
+                        fresh_hidden = _get_hidden_local(r_refresh.text)
+                        submit_data = {**hidden3, **fresh_hidden}
+                        if not submit_data.get("submitButton"):
+                            submit_data["submitButton"] = "Devam Et"
+
+                        r_poll = sess.post(
+                            form_url,
+                            data=submit_data,
+                            timeout=30,
+                            allow_redirects=True,
+                        )
+                        final_url = r_poll.url
+                        if _BILIRKISI_BASE in final_url:
+                            callback_url = final_url
+                            parsed_final = urlparse(final_url)
+                            qs = parse_qs(parsed_final.query)
+                            code = qs.get("code", [None])[0]
+                        elif "code=" in final_url:
+                            callback_url = final_url
+                            code = parse_qs(urlparse(final_url).query).get("code", [None])[0]
+                        else:
+                            poll_text = re.sub(r"<[^>]+>", " ", r_poll.text)
+                            poll_text = re.sub(r"\s+", " ", poll_text).strip()[:400]
+                            return json.dumps({
+                                "durum": "hata",
+                                "mesaj": (
+                                    "İmzalama tamamlandı ama OAuth redirect alınamadı. "
+                                    "Telefondaki tarayıcıdan USB debugging ile cookie alın."
+                                ),
+                                "result_code": result_code,
+                                "ajax_yanit": poll_response,
+                                "submit_data": list(submit_data.keys()),
+                                "son_url": final_url,
+                                "sayfa_ozeti": poll_text,
+                            }, ensure_ascii=False)
+                except Exception as exc:
+                    return tool_error(f"Oturum kontrol hatası: {exc}")
 
         # UYAP callback URL'sini çağır — UYAP oturumu kur
         try:
