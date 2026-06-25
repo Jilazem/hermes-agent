@@ -165,6 +165,169 @@ def _merge_browser_path(existing_path: str = "") -> str:
 _last_screenshot_cleanup_by_dir: dict[str, float] = {}
 
 # ============================================================================
+# Chromium net::ERR_* page-load error classification
+# ============================================================================
+
+# Maps Chromium net error codes to (short_reason, user_hint) tuples.
+# The hint is surfaced in the structured error so the model can advise the user
+# without needing to know Chromium internals.
+_NET_ERROR_MAP: dict[str, tuple[str, str]] = {
+    "ERR_NAME_NOT_RESOLVED": (
+        "dns_resolution_failed",
+        "The hostname could not be resolved. Check that the URL is correct and "
+        "the domain exists (e.g. a typo, or the site may be down).",
+    ),
+    "ERR_NAME_NOT_RESOLVED_DNS_PROBE_FINISHED_NXDOMAIN": (
+        "dns_resolution_failed",
+        "The hostname could not be resolved (NXDOMAIN). The domain does not exist.",
+    ),
+    "ERR_CONNECTION_REFUSED": (
+        "connection_refused",
+        "The server actively refused the connection. The service may not be "
+        "running on that port, or a firewall is blocking access.",
+    ),
+    "ERR_CONNECTION_TIMED_OUT": (
+        "connection_timeout",
+        "The connection attempt timed out. The server may be unreachable or "
+        "overloaded. Try again later.",
+    ),
+    "ERR_CONNECTION_RESET": (
+        "connection_reset",
+        "The connection was reset by the remote server. This is often transient; "
+        "try reloading the page.",
+    ),
+    "ERR_CONNECTION_CLOSED": (
+        "connection_closed",
+        "The connection was closed unexpectedly. Try again.",
+    ),
+    "ERR_INTERNET_DISCONNECTED": (
+        "no_internet",
+        "The browser reports no internet connection. Check network connectivity.",
+    ),
+    "ERR_NETWORK_CHANGED": (
+        "network_changed",
+        "The network configuration changed mid-request. Try again.",
+    ),
+    "ERR_SSL_PROTOCOL_ERROR": (
+        "ssl_error",
+        "An SSL/TLS protocol error occurred. The server's certificate or TLS "
+        "configuration may be invalid.",
+    ),
+    "ERR_CERT_COMMON_NAME_INVALID": (
+        "ssl_cert_mismatch",
+        "The server's SSL certificate does not match the hostname.",
+    ),
+    "ERR_CERT_DATE_INVALID": (
+        "ssl_cert_expired",
+        "The server's SSL certificate has expired or is not yet valid.",
+    ),
+    "ERR_CERT_AUTHORITY_INVALID": (
+        "ssl_cert_untrusted",
+        "The server's SSL certificate is not trusted (self-signed or unknown CA).",
+    ),
+    "ERR_TOO_MANY_REDIRECTS": (
+        "redirect_loop",
+        "The page caused a redirect loop. Check the URL or try clearing cookies.",
+    ),
+    "ERR_INVALID_URL": (
+        "invalid_url",
+        "The URL is malformed. Verify the URL format.",
+    ),
+    "ERR_BLOCKED_BY_CLIENT": (
+        "blocked_by_client",
+        "The request was blocked, possibly by an extension or content filter.",
+    ),
+    "ERR_ABORTED": (
+        "navigation_aborted",
+        "The navigation was aborted (the page may have redirected away before "
+        "finishing load). Try calling browser_snapshot to see current state.",
+    ),
+    "ERR_TUNNEL_CONNECTION_FAILED": (
+        "proxy_tunnel_failed",
+        "Could not establish a tunnel through the proxy.",
+    ),
+    "ERR_PROXY_CONNECTION_FAILED": (
+        "proxy_failed",
+        "The proxy server connection failed.",
+    ),
+    "ERR_EMPTY_RESPONSE": (
+        "empty_response",
+        "The server returned an empty response. The server may be misconfigured "
+        "or temporarily unavailable.",
+    ),
+    "ERR_RESPONSE_HEADERS_TOO_BIG": (
+        "response_headers_too_large",
+        "The server sent headers that are too large to process.",
+    ),
+    "ERR_UNSAFE_PORT": (
+        "unsafe_port",
+        "The browser blocked navigation to this port for security reasons. "
+        "Use a standard web port (80, 443) or configure the browser to allow it.",
+    ),
+    "ERR_DISALLOWED_URL_SCHEME": (
+        "disallowed_scheme",
+        "The URL scheme is not allowed. Use http:// or https://.",
+    ),
+    "ERR_ADDRESS_UNREACHABLE": (
+        "address_unreachable",
+        "The IP address is unreachable. The host may be down or firewalled.",
+    ),
+    "ERR_TIMED_OUT": (
+        "page_load_timeout",
+        "The page took too long to load. The server may be slow or unresponsive.",
+    ),
+    "ERR_FAILED": (
+        "navigation_failed",
+        "Navigation failed with a generic error. Check the URL and try again.",
+    ),
+}
+
+
+def _classify_page_load_error(error_str: str) -> Optional[dict]:
+    """Detect a Chromium net::ERR_* code in *error_str* and return a structured
+    error dict, or None if no known code is found.
+
+    The returned dict has the same ``success``/``error`` shape as the rest of
+    ``browser_navigate``'s failure returns, plus two extra fields:
+      - ``error_code``: the short machine-readable reason (e.g. ``"dns_resolution_failed"``)
+      - ``hint``: a human-readable suggestion for what to do next
+    """
+    if not error_str:
+        return None
+
+    upper = error_str.upper()
+    # Fast scan: only enter the O(n) loop when "ERR_" is present.
+    if "ERR_" not in upper:
+        return None
+
+    for code, (reason, hint) in _NET_ERROR_MAP.items():
+        if code in upper:
+            return {
+                "success": False,
+                "error": error_str,
+                "error_code": reason,
+                "hint": hint,
+            }
+
+    # Unknown net:: error — still structured so callers can detect the family.
+    import re
+    match = re.search(r"net::(ERR_[A-Z0-9_]+)", error_str, re.IGNORECASE)
+    if match:
+        code_raw = match.group(1).upper()
+        return {
+            "success": False,
+            "error": error_str,
+            "error_code": "chromium_net_error",
+            "hint": (
+                f"Chromium reported a network error ({code_raw}). "
+                "Check the URL and network connectivity."
+            ),
+        }
+
+    return None
+
+
+# ============================================================================
 # Configuration
 # ============================================================================
 
@@ -2335,9 +2498,13 @@ def browser_navigate(url: str, task_id: Optional[str] = None) -> str:
 
         return json.dumps(response, ensure_ascii=False)
     else:
+        raw_error = result.get("error", "Navigation failed")
+        classified = _classify_page_load_error(raw_error)
+        if classified is not None:
+            return json.dumps(classified, ensure_ascii=False)
         return json.dumps({
             "success": False,
-            "error": result.get("error", "Navigation failed")
+            "error": raw_error,
         }, ensure_ascii=False)
 
 
