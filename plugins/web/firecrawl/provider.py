@@ -152,7 +152,10 @@ def _is_tool_gateway_ready() -> bool:
     their patches honored. The names are re-exported on
     :mod:`tools.web_tools` for exactly this reason.
     """
-    import tools.web_tools as _wt
+    try:
+        import tools.web_tools as _wt
+    except ImportError:
+        return False
 
     return _wt.resolve_managed_tool_gateway(
         "firecrawl", token_reader=_wt._read_nous_access_token

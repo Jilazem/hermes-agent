@@ -63,11 +63,11 @@ class BraveFreeWebSearchProvider(WebSearchProvider):
         Returns ``{"success": True, "data": {"web": [{"title", "url", "description", "position"}]}}``
         on success, or ``{"success": False, "error": str}`` on failure.
         """
-        import httpx
-
         api_key = os.getenv("BRAVE_SEARCH_API_KEY", "").strip()
         if not api_key:
             return {"success": False, "error": "BRAVE_SEARCH_API_KEY is not set"}
+
+        import httpx
 
         # Brave's `count` is capped at 20.
         count = max(1, min(int(limit), 20))

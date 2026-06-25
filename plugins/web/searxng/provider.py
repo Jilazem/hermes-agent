@@ -54,11 +54,11 @@ class SearXNGWebSearchProvider(WebSearchProvider):
 
     def search(self, query: str, limit: int = 5) -> Dict[str, Any]:
         """Execute a search against the configured SearXNG instance."""
-        import httpx
-
         base_url = os.getenv("SEARXNG_URL", "").strip().rstrip("/")
         if not base_url:
             return {"success": False, "error": "SEARXNG_URL is not set"}
+
+        import httpx
 
         params: Dict[str, Any] = {
             "q": query,
