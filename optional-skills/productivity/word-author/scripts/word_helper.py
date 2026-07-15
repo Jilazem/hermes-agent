@@ -279,8 +279,8 @@ def ornek_rapor_uret(dosya: str, baslik: str, yazar: str, tarih: str,
     tablo_ekle(doc, [
         ["Metrik", "Deger", "Hedef", "Durum"],
         ["Ornek A", "142", "150", "Iyi"],
-        ["Ornek B", "87", "80", "Asti"],
-        ["Ornek C", "220", "200", "Asti"],
+        ["Ornek B", "87", "80", "Geçti"],
+        ["Ornek C", "220", "200", "Geçti"],
     ])
 
     baslikli_bolum_ekle(doc, "Notlar")
@@ -307,8 +307,15 @@ def main() -> None:
     _require_docx()
 
     if args.tablo:
-        with open(args.tablo, encoding="utf-8") as f:
-            veri = json.load(f)
+        try:
+            with open(args.tablo, encoding="utf-8") as f:
+                veri = json.load(f)
+        except FileNotFoundError:
+            print(f"HATA: JSON dosyası bulunamadı: {args.tablo}", file=sys.stderr)
+            sys.exit(1)
+        except json.JSONDecodeError as exc:
+            print(f"HATA: Geçersiz JSON: {exc}", file=sys.stderr)
+            sys.exit(1)
         doc = belge_olustur(args.template)
         kenar_bosluklari_ayarla(doc)
         kapak_sayfasi_ekle(doc, args.baslik, args.yazar, args.tarih)

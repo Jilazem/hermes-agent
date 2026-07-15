@@ -300,13 +300,21 @@ def main() -> None:
     ap.add_argument("--baslik", default="Taşınmaz Analiz Raporu",
                     help="Rapor başlığı")
     ap.add_argument("--tarih", default=str(date.today()),
-                    help="Rapor tarihi (YYYY-AA-GG)")
+                    help="Rapor tarihi (YYYY-MM-DD)")
     ap.add_argument("--out-dir", default="./out",
                     help="Çıktı dizini (varsayılan: ./out)")
     args = ap.parse_args()
 
-    with open(args.input, encoding="utf-8") as f:
-        veriler: Any = json.load(f)
+    try:
+        with open(args.input, encoding="utf-8") as f:
+            veriler: Any = json.load(f)
+    except FileNotFoundError:
+        print(f"HATA: Giriş dosyası bulunamadı: {args.input}", file=sys.stderr)
+        sys.exit(1)
+    except json.JSONDecodeError as exc:
+        print(f"HATA: Geçersiz JSON: {exc}", file=sys.stderr)
+        print("parsel_sorgu.py çıktısının doğru JSON olduğundan emin olun.", file=sys.stderr)
+        sys.exit(1)
 
     # Tek obje veya liste kabul et
     if isinstance(veriler, dict):

@@ -1,6 +1,6 @@
 ---
 name: word-author
-description: "Produce .docx files with tables, headings, and images."
+description: Produce .docx files with tables, headings, and images.
 version: 1.0.0
 author: Hermes Agent
 license: MIT
@@ -153,7 +153,7 @@ def hucre_rengi_ata(hucre, hex_renk: str) -> None:
 
 satirlar_verisi = [
     ["Ürün", "Q1", "Q2", "Değişim"],
-    ["Widget A", "1 200", "1 416", "+18%"],
+    ["Widget A", "1200", "1416", "+18%"],
     ["Widget B", "850", "935", "+10%"],
     ["Widget C", "320", "384", "+20%"],
 ]

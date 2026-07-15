@@ -70,7 +70,7 @@ def _get(url: str, timeout: int = _DEFAULT_TIMEOUT, retry: int = 3) -> Optional[
 
     for attempt in range(1, retry + 1):
         try:
-            r = requests.get(url, headers=_HEADERS, timeout=timeout)
+            r = requests.get(url, headers=_HEADERS, timeout=timeout, verify=True)
             r.raise_for_status()
             return r.json()
         except requests.exceptions.Timeout:
@@ -210,9 +210,17 @@ def sorgu_koordinat(lat: float, lon: float, retry: int = 3) -> dict:
 def toplu_sorgu_csv(csv_dosya: str, retry: int = 3) -> list[dict]:
     """CSV dosyasından toplu parsel sorgula. Gerekli sütunlar: il,ilce,ada,parsel."""
     sonuclar = []
-    with open(csv_dosya, newline="", encoding="utf-8-sig") as f:
-        reader = csv.DictReader(f)
-        satirlar = list(reader)
+    try:
+        with open(csv_dosya, newline="", encoding="utf-8-sig") as f:
+            reader = csv.DictReader(f)
+            satirlar = list(reader)
+    except FileNotFoundError:
+        print(f"HATA: CSV dosyası bulunamadı: {csv_dosya}", file=sys.stderr)
+        print("Beklenen sütunlar: il, ilce, ada, parsel (virgülle ayrılmış)", file=sys.stderr)
+        sys.exit(1)
+    except Exception as exc:
+        print(f"HATA: CSV okunamadı: {exc}", file=sys.stderr)
+        sys.exit(1)
 
     print(f"{len(satirlar)} parsel sorgulanacak...", file=sys.stderr)
     for i, satir in enumerate(satirlar, 1):

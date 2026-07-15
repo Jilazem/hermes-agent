@@ -1,6 +1,6 @@
 ---
 name: parsel-tapu
-description: "Query Turkish land parcels and produce deed reports."
+description: Query Turkish land parcels and produce deed reports.
 version: 1.0.0
 author: Hermes Agent
 license: MIT
@@ -94,7 +94,7 @@ python scripts/tapu_raporu.py --input sonuclar.json --format docx \
 
 ```
 1. TKGM CBS API  →  JSON yanıtı, yapılandırılmış, API anahtarı gerektirmez
-2. parselsorgu.tkgm.gov.tr  →  browser_navigate + browser_snapshot ile scraping
+2. parselsorgu.tkgm.gov.tr  →  `browser_navigate` + `web_extract` ile scraping
 3. e-Tapu portalı  →  TC kimlik girişi gerektirir (kısıtlı bilgi)
 ```
 
@@ -129,7 +129,7 @@ CBS API yanıt vermezse `web_extract` + `browser_navigate` ile:
 ```
 browser_navigate("https://parselsorgu.tkgm.gov.tr")
 # → Ada/Parsel alanlarını doldur
-# → browser_snapshot ile sonuç tablosunu oku
+# → web_extract ile sonuç tablosunu oku
 # → JSON'a normalize et
 ```
 
