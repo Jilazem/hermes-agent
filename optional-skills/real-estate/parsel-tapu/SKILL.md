@@ -1,6 +1,6 @@
 ---
 name: parsel-tapu
-description: "Parsel sorgula, tapu bilgisi al, Excel/Word raporu üret."
+description: "Query Turkish land parcels and produce deed reports."
 version: 1.0.0
 author: Hermes Agent
 license: MIT

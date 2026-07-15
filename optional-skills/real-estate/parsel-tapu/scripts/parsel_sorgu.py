@@ -98,10 +98,13 @@ def _normalize_cbs_feature(feature: dict) -> dict:
     if coords and geom.get("type") == "Polygon":
         ring = coords[0]
         if ring:
-            lons = [c[0] for c in ring]
-            lats = [c[1] for c in ring]
-            lon = sum(lons) / len(lons)
-            lat = sum(lats) / len(lats)
+            n = len(ring)
+            sum_lon = sum_lat = 0.0
+            for c in ring:
+                sum_lon += c[0]
+                sum_lat += c[1]
+            lon = sum_lon / n
+            lat = sum_lat / n
     elif coords and geom.get("type") == "Point":
         lon, lat = coords[0], coords[1]
 
@@ -211,7 +214,7 @@ def toplu_sorgu_csv(csv_dosya: str, retry: int = 3) -> list[dict]:
         reader = csv.DictReader(f)
         satirlar = list(reader)
 
-    print(f"{len(satirlar)} parsel sorgulanacak…", file=sys.stderr)
+    print(f"{len(satirlar)} parsel sorgulanacak...", file=sys.stderr)
     for i, satir in enumerate(satirlar, 1):
         il = satir.get("il", "").strip()
         ilce = satir.get("ilce", "").strip()

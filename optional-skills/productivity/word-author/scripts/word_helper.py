@@ -20,28 +20,35 @@ from typing import Any, Optional
 
 
 # ---------------------------------------------------------------------------
-# Yardımcı fonksiyonlar
+# python-docx — module-level import (tek seferlik)
 # ---------------------------------------------------------------------------
+try:
+    from docx import Document
+    from docx.shared import Inches, Pt, RGBColor
+    from docx.enum.text import WD_ALIGN_PARAGRAPH
+    from docx.enum.table import WD_TABLE_ALIGNMENT
+    from docx.oxml.ns import qn
+    from docx.oxml import OxmlElement
+    _DOCX_AVAILABLE = True
+except ImportError:
+    _DOCX_AVAILABLE = False
 
-def _docx_imports():
-    """python-docx import'larını döner; yoksa açıklayıcı hata verir."""
-    try:
-        from docx import Document
-        from docx.shared import Inches, Pt, RGBColor
-        from docx.enum.text import WD_ALIGN_PARAGRAPH
-        from docx.enum.table import WD_TABLE_ALIGNMENT
-        from docx.oxml.ns import qn
-        from docx.oxml import OxmlElement
-    except ImportError:
+
+def _require_docx() -> None:
+    """python-docx yüklü değilse açıklayıcı hata verip çık."""
+    if not _DOCX_AVAILABLE:
         print("HATA: 'python-docx' yüklü değil. Kur: pip install python-docx",
               file=sys.stderr)
         sys.exit(1)
-    return Document, Inches, Pt, RGBColor, WD_ALIGN_PARAGRAPH, WD_TABLE_ALIGNMENT, qn, OxmlElement
 
+
+# ---------------------------------------------------------------------------
+# Yardımcı fonksiyonlar
+# ---------------------------------------------------------------------------
 
 def hucre_rengi(hucre, hex_renk: str) -> None:
     """Tablo hücresine düz arka plan rengi ata (OOXML düzeyinde)."""
-    _, _, _, _, _, _, qn, OxmlElement = _docx_imports()
+    _require_docx()
     tc_pr = hucre._tc.get_or_add_tcPr()
     shd = OxmlElement("w:shd")
     shd.set(qn("w:fill"), hex_renk)
@@ -52,7 +59,7 @@ def hucre_rengi(hucre, hex_renk: str) -> None:
 
 def sayfa_numarasi_ekle(paragraph) -> None:
     """Paragrafın sonuna Word sayfa-numarası alanı ekle."""
-    _, _, _, _, _, _, qn, OxmlElement = _docx_imports()
+    _require_docx()
     run = paragraph.add_run()
     for tag, metin in [("begin", None), (None, " PAGE "), ("end", None)]:
         if tag:
@@ -71,7 +78,7 @@ def sayfa_numarasi_ekle(paragraph) -> None:
 
 def belge_olustur(sablon: Optional[str] = None):
     """Boş veya şablondan yeni belge döner."""
-    Document, *_ = _docx_imports()
+    _require_docx()
     if sablon and Path(sablon).exists():
         return Document(sablon)
     return Document()
@@ -79,7 +86,6 @@ def belge_olustur(sablon: Optional[str] = None):
 
 def kenar_bosluklari_ayarla(doc, ust=1.0, alt=1.0, sol=1.2, sag=1.2) -> None:
     """Sayfa kenar boşluklarını inç cinsinden ayarla."""
-    _, Inches, *_ = _docx_imports()
     sec = doc.sections[0]
     sec.top_margin = Inches(ust)
     sec.bottom_margin = Inches(alt)
@@ -90,8 +96,6 @@ def kenar_bosluklari_ayarla(doc, ust=1.0, alt=1.0, sol=1.2, sag=1.2) -> None:
 def kapak_sayfasi_ekle(doc, baslik: str, yazar: str = "",
                         tarih: str = "") -> None:
     """Ortalanmış başlık, yazar ve tarih ile kapak sayfası ekle."""
-    _, _, Pt, RGBColor, WD_ALIGN_PARAGRAPH, *_ = _docx_imports()
-
     h = doc.add_heading(baslik, level=0)
     h.alignment = WD_ALIGN_PARAGRAPH.CENTER
     if h.runs:
@@ -143,7 +147,6 @@ def tablo_ekle(doc, satirlar: list[list[Any]],
         baslik_rengi: Başlık arka plan rengi (hex, '#' olmadan)
         satir_zebra: Çift/tek satırlar değişimli renkle mi gösterilsin?
     """
-    _, _, _, RGBColor, *_ = _docx_imports()
     if not satirlar:
         return
 
@@ -203,7 +206,6 @@ def json_tablo_ekle(doc, json_veri: Any, tablo_baslik: str = "") -> None:
 def ustbilgi_altbilgi_ekle(doc, ustbilgi_metni: str = "",
                              altbilgi_sayfa_no: bool = True) -> None:
     """Üstbilgi metni ve/veya sayfalı altbilgi ekle."""
-    _, _, Pt, _, WD_ALIGN_PARAGRAPH, *_ = _docx_imports()
     section = doc.sections[0]
 
     if ustbilgi_metni:
@@ -222,9 +224,8 @@ def ustbilgi_altbilgi_ekle(doc, ustbilgi_metni: str = "",
 def resim_ekle(doc, resim_yolu: str, genislik_inc: float = 5.0,
                aciklama: str = "") -> None:
     """Belgeye resim ve isteğe bağlı açıklama ekle."""
-    _, Inches, _, _, WD_ALIGN_PARAGRAPH, *_ = _docx_imports()
     if not Path(resim_yolu).exists():
-        doc.add_paragraph(f"[Resim bulunamadı: {resim_yolu}]")
+        doc.add_paragraph(f"[Resim bulunamadi: {resim_yolu}]")
         return
     doc.add_picture(resim_yolu, width=Inches(genislik_inc))
     if aciklama:
@@ -241,17 +242,15 @@ def belge_kaydet(doc, dosya: str) -> None:
 
 def belge_dogrula(dosya: str) -> dict:
     """Kaydedilen belgeyi yükle ve temel istatistik döndür."""
-    Document, *_ = _docx_imports()
+    _require_docx()
     doc = Document(dosya)
     sonuc = {
         "dosya": dosya,
         "paragraf_sayisi": len(doc.paragraphs),
         "tablo_sayisi": len(doc.tables),
-        "toplam_kelime": sum(
-            len(p.text.split()) for p in doc.paragraphs
-        ),
+        "toplam_kelime": sum(len(p.text.split()) for p in doc.paragraphs),
     }
-    print(f"Doğrulama OK — {sonuc}")
+    print(f"Dogrulama OK - {sonuc}")
     return sonuc
 
 
@@ -267,26 +266,26 @@ def ornek_rapor_uret(dosya: str, baslik: str, yazar: str, tarih: str,
     kapak_sayfasi_ekle(doc, baslik, yazar, tarih)
     ustbilgi_altbilgi_ekle(doc, ustbilgi_metni=baslik)
 
-    baslikli_bolum_ekle(doc, "Yönetici Özeti",
-                         "Bu belge word-author skill'i ile otomatik üretilmiştir.")
+    baslikli_bolum_ekle(doc, "Yonetici Ozeti",
+                         "Bu belge word-author skill'i ile otomatik uretilmistir.")
     baslikli_bolum_ekle(doc, "Temel Bulgular", seviye=2)
     madde_listesi_ekle(doc, [
-        "Konu 1: Önemli bir bulgu",
-        "Konu 2: İkinci önemli nokta",
-        "Konu 3: Önerilen eylem",
+        "Konu 1: Onemli bir bulgu",
+        "Konu 2: Ikinci onemli nokta",
+        "Konu 3: Onerilen eylem",
     ])
 
-    baslikli_bolum_ekle(doc, "Sayısal Özet")
+    baslikli_bolum_ekle(doc, "Sayisal Ozet")
     tablo_ekle(doc, [
-        ["Metrik", "Değer", "Hedef", "Durum"],
-        ["Örnek A", "142", "150", "İyi"],
-        ["Örnek B", "87", "80", "Aştı"],
-        ["Örnek C", "220", "200", "Aştı"],
+        ["Metrik", "Deger", "Hedef", "Durum"],
+        ["Ornek A", "142", "150", "Iyi"],
+        ["Ornek B", "87", "80", "Asti"],
+        ["Ornek C", "220", "200", "Asti"],
     ])
 
     baslikli_bolum_ekle(doc, "Notlar")
     doc.add_paragraph(
-        "Bu rapor örnek amaçlıdır. Gerçek veri için ilgili kaynakları kullanın."
+        "Bu rapor ornek amaclidir. Gercek veri icin ilgili kaynaklari kullanin."
     )
 
     belge_kaydet(doc, dosya)
@@ -294,19 +293,20 @@ def ornek_rapor_uret(dosya: str, baslik: str, yazar: str, tarih: str,
 
 
 def main() -> None:
-    ap = argparse.ArgumentParser(description="Word (DOCX) Belge Yardımcısı")
-    ap.add_argument("--out", required=True, help="Çıktı dosyası (.docx)")
-    ap.add_argument("--baslik", default="Rapor", help="Belge başlığı")
-    ap.add_argument("--yazar", default="", help="Yazar adı")
+    ap = argparse.ArgumentParser(description="Word (DOCX) Belge Yardimcisi")
+    ap.add_argument("--out", required=True, help="Cikti dosyasi (.docx)")
+    ap.add_argument("--baslik", default="Rapor", help="Belge basligi")
+    ap.add_argument("--yazar", default="", help="Yazar adi")
     ap.add_argument("--tarih", default=str(date.today()), help="Tarih")
-    ap.add_argument("--template", default=None, help="Şablon .docx dosyası")
-    ap.add_argument("--tablo", default=None, help="Tablo verisi (.json dosyası)")
-    ap.add_argument("--tablo-baslik", default="", help="Tablo üstüne başlık")
-    ap.add_argument("--verify", action="store_true", help="Kaydedilen belgeyi doğrula")
+    ap.add_argument("--template", default=None, help="Sablon .docx dosyasi")
+    ap.add_argument("--tablo", default=None, help="Tablo verisi (.json dosyasi)")
+    ap.add_argument("--tablo-baslik", default="", help="Tablo ustune baslik")
+    ap.add_argument("--verify", action="store_true", help="Kaydedilen belgeyi dogrula")
     args = ap.parse_args()
 
+    _require_docx()
+
     if args.tablo:
-        # Sadece JSON tablosu içeren belge üret
         with open(args.tablo, encoding="utf-8") as f:
             veri = json.load(f)
         doc = belge_olustur(args.template)
@@ -323,3 +323,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+

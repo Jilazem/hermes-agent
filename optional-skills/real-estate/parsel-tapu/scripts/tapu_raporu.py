@@ -141,6 +141,7 @@ def word_raporu_uret(parseller: list[dict], dosya: str, baslik: str,
                      tarih: str) -> None:
     try:
         from docx import Document
+        from docx.oxml import OxmlElement
         from docx.oxml.ns import qn
         from docx.shared import Inches, Pt, RGBColor
         from docx.enum.text import WD_ALIGN_PARAGRAPH
@@ -211,7 +212,6 @@ def word_raporu_uret(parseller: list[dict], dosya: str, baslik: str,
         hucre.paragraphs[0].runs[0].font.color.rgb = RGBColor(0xFF, 0xFF, 0xFF)
         # Arka plan rengi (OOXML)
         shading = hucre._tc.get_or_add_tcPr()
-        from docx.oxml import OxmlElement
         shd = OxmlElement("w:shd")
         shd.set(qn("w:fill"), "2E74B5")
         shd.set(qn("w:color"), "auto")
@@ -232,7 +232,6 @@ def word_raporu_uret(parseller: list[dict], dosya: str, baslik: str,
             hucre = satir.cells[c]
             hucre.text = str(deger or "")
             if dolu:
-                from docx.oxml import OxmlElement
                 shading = hucre._tc.get_or_add_tcPr()
                 shd = OxmlElement("w:shd")
                 shd.set(qn("w:fill"), "DEEAF1")

@@ -1,6 +1,6 @@
 ---
 name: word-author
-description: "python-docx ile .docx belgesi üret; tablolar, başlıklar, resimler."
+description: "Produce .docx files with tables, headings, and images."
 version: 1.0.0
 author: Hermes Agent
 license: MIT
