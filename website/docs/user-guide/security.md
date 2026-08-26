@@ -249,12 +249,12 @@ Control how unauthorized direct messages are handled in `~/.hermes/config.yaml`:
 unauthorized_dm_behavior: pair
 
 whatsapp:
-  unauthorized_dm_behavior: ignore
+  unauthorized_dm_behavior: pair
 ```
 
-- `pair` is the default. Unauthorized DMs get a pairing code reply.
-- `ignore` silently drops unauthorized DMs.
-- Platform sections override the global default, so you can keep pairing on Telegram while keeping WhatsApp silent.
+- `pair` is the default everywhere except WhatsApp. Unauthorized DMs get a pairing code reply.
+- `ignore` silently drops unauthorized DMs. This is WhatsApp's default even with no config at all, since a pairing-code reply would reveal the bot to a stranger texting what's usually a personal or business number.
+- Platform sections override the default in either direction, so you can keep pairing on Telegram while keeping WhatsApp silent, or opt WhatsApp back into pairing with `whatsapp.unauthorized_dm_behavior: pair`.
 
 **Security features** (based on OWASP + NIST SP 800-63-4 guidance):
 

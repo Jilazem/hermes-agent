@@ -355,10 +355,43 @@ def test_telegram_group_users_mixed_sender_and_legacy_chat(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_unauthorized_dm_pairs_by_default(monkeypatch):
+async def test_whatsapp_unauthorized_dm_ignored_by_default(monkeypatch):
+    """WhatsApp is usually a personal/business number, not a bot account:
+    unauthorized DMs are silently dropped out of the box, with no config
+    needed, so a stranger never learns the number is running a bot via a
+    "here's your pairing code" reply.
+    """
     _clear_auth_env(monkeypatch)
     config = GatewayConfig(
         platforms={Platform.WHATSAPP: PlatformConfig(enabled=True)},
+    )
+    runner, adapter = _make_runner(Platform.WHATSAPP, config)
+
+    result = await runner._handle_message(
+        _make_event(
+            Platform.WHATSAPP,
+            "15551234567@s.whatsapp.net",
+            "15551234567@s.whatsapp.net",
+        )
+    )
+
+    assert result is None
+    runner.pairing_store.generate_code.assert_not_called()
+    adapter.send.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_whatsapp_explicit_pair_config_restores_pairing(monkeypatch):
+    """Operators who still want the pairing flow on WhatsApp can opt back in
+    with an explicit whatsapp.unauthorized_dm_behavior: pair."""
+    _clear_auth_env(monkeypatch)
+    config = GatewayConfig(
+        platforms={
+            Platform.WHATSAPP: PlatformConfig(
+                enabled=True,
+                extra={"unauthorized_dm_behavior": "pair"},
+            ),
+        },
     )
     runner, adapter = _make_runner(Platform.WHATSAPP, config)
     runner.pairing_store.generate_code.return_value = "ABC12DEF"
@@ -412,7 +445,12 @@ async def test_rate_limited_user_gets_no_response(monkeypatch):
     """When a user is already rate-limited, pairing messages are silently ignored."""
     _clear_auth_env(monkeypatch)
     config = GatewayConfig(
-        platforms={Platform.WHATSAPP: PlatformConfig(enabled=True)},
+        platforms={
+            Platform.WHATSAPP: PlatformConfig(
+                enabled=True,
+                extra={"unauthorized_dm_behavior": "pair"},  # exercise the pairing path
+            ),
+        },
     )
     runner, adapter = _make_runner(Platform.WHATSAPP, config)
     runner.pairing_store._is_rate_limited.return_value = True
@@ -436,7 +474,12 @@ async def test_rejection_message_records_rate_limit(monkeypatch):
     so subsequent messages are silently ignored."""
     _clear_auth_env(monkeypatch)
     config = GatewayConfig(
-        platforms={Platform.WHATSAPP: PlatformConfig(enabled=True)},
+        platforms={
+            Platform.WHATSAPP: PlatformConfig(
+                enabled=True,
+                extra={"unauthorized_dm_behavior": "pair"},  # exercise the pairing path
+            ),
+        },
     )
     runner, adapter = _make_runner(Platform.WHATSAPP, config)
     runner.pairing_store.generate_code.return_value = None  # triggers rejection
@@ -626,6 +669,21 @@ def test_get_unauthorized_dm_behavior_no_allowlist_returns_pair(monkeypatch):
 
     behavior = runner._get_unauthorized_dm_behavior(Platform.SIGNAL)
     assert behavior == "pair"
+
+
+def test_whatsapp_no_allowlist_defaults_to_ignore(monkeypatch):
+    """Unlike other platforms, WhatsApp defaults to 'ignore' even without an
+    allowlist -- see test_whatsapp_unauthorized_dm_ignored_by_default for why.
+    """
+    _clear_auth_env(monkeypatch)
+
+    config = GatewayConfig(
+        platforms={Platform.WHATSAPP: PlatformConfig(enabled=True)},
+    )
+    runner, _adapter = _make_runner(Platform.WHATSAPP, config)
+
+    behavior = runner._get_unauthorized_dm_behavior(Platform.WHATSAPP)
+    assert behavior == "ignore"
 
 
 def test_qqbot_with_allowlist_ignores_unauthorized_dm(monkeypatch):

@@ -111,14 +111,14 @@ To use the pairing flow instead, remove both variables and rely on the
 Optional behavior settings in `~/.hermes/config.yaml`:
 
 ```yaml
-unauthorized_dm_behavior: pair
+unauthorized_dm_behavior: pair    # global default for other platforms
 
 whatsapp:
-  unauthorized_dm_behavior: ignore
+  unauthorized_dm_behavior: pair  # opt back in on WhatsApp; default is "ignore"
 ```
 
-- `unauthorized_dm_behavior: pair` is the global default. Unknown DM senders get a pairing code.
-- `whatsapp.unauthorized_dm_behavior: ignore` makes WhatsApp stay silent for unauthorized DMs, which is usually the better choice for a private number.
+- `unauthorized_dm_behavior: pair` is the global default for other platforms — unknown DM senders get a pairing code reply.
+- WhatsApp is the exception: it defaults to `ignore` with no config needed, since a "here's your pairing code" reply would tip off a stranger texting the number that they're talking to a bot. Set `whatsapp.unauthorized_dm_behavior: pair` if you want pairing codes on WhatsApp too.
 
 Then start the gateway:
 
@@ -213,7 +213,7 @@ When the agent calls tools (web search, file operations, etc.), WhatsApp display
 | **Bot stops working after WhatsApp update** | Update Hermes to get the latest bridge version, then re-pair. |
 | **macOS: "Node.js not installed" but node works in terminal** | launchd services don't inherit your shell PATH. Run `hermes gateway install` to re-snapshot your current PATH into the plist, then `hermes gateway start`. See the [Gateway Service docs](./index.md#macos-launchd) for details. |
 | **Messages not being received** | Verify `WHATSAPP_ALLOWED_USERS` includes the sender's number (with country code, no `+` or spaces), or set it to `*` to allow everyone. Set `WHATSAPP_DEBUG=true` in `.env` and restart the gateway to see raw message events in `bridge.log`. |
-| **Bot replies to strangers with a pairing code** | Set `whatsapp.unauthorized_dm_behavior: ignore` in `~/.hermes/config.yaml` if you want unauthorized DMs to be silently ignored instead. |
+| **Bot replies to strangers with a pairing code** | This only happens if you've explicitly set `whatsapp.unauthorized_dm_behavior: pair` — WhatsApp ignores unauthorized DMs silently by default. Remove that override (or set it to `ignore`) to go back to silence. |
 
 ---
 
@@ -226,11 +226,11 @@ phone numbers (including country code, without the `+`), use `*` to allow everyo
 messages** as a safety measure.
 :::
 
-By default, unauthorized DMs still receive a pairing code reply. If you want a private WhatsApp number to stay completely silent to strangers, set:
+Unauthorized DMs are silently ignored by default — strangers who text the number get no reply, so they never learn it's running a bot. If you'd rather they get a pairing code they can hand you for approval, opt in with:
 
 ```yaml
 whatsapp:
-  unauthorized_dm_behavior: ignore
+  unauthorized_dm_behavior: pair
 ```
 
 - The `~/.hermes/platforms/whatsapp/session` directory contains full session credentials — protect it like a password

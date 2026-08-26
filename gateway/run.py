@@ -5593,7 +5593,13 @@ class GatewayRunner:
            the allowlist signals that the owner has deliberately restricted
            access; spamming unknown contacts with pairing codes is both noisy
            and a potential info-leak. (#9337)
-        4. No allowlist and no explicit config → ``"pair"`` (open-gateway default).
+        4. WhatsApp defaults to ``"ignore"`` even with no allowlist and no
+           explicit config — a WhatsApp number is usually someone's personal
+           or business line rather than a dedicated bot account, so a
+           stranger who texts it should not be tipped off that it's running
+           a bot by an unsolicited "here's your pairing code" reply.
+        5. Everywhere else, no allowlist and no explicit config → ``"pair"``
+           (open-gateway default).
         """
         config = getattr(self, "config", None)
 
@@ -5645,6 +5651,14 @@ class GatewayRunner:
                     return "ignore"
 
         if os.getenv("GATEWAY_ALLOWED_USERS", "").strip():
+            return "ignore"
+
+        # WhatsApp numbers are typically personal/business lines, not
+        # dedicated bot accounts — silently drop unauthorized DMs by default
+        # so a stranger never learns the number is running a bot. Operators
+        # who want pairing codes on WhatsApp can opt back in explicitly with
+        # whatsapp.unauthorized_dm_behavior: pair.
+        if platform == Platform.WHATSAPP:
             return "ignore"
 
         return "pair"

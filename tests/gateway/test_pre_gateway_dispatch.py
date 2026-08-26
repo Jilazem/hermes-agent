@@ -41,11 +41,11 @@ def _make_event(text: str = "hello", platform: Platform = Platform.WHATSAPP) -> 
     )
 
 
-def _make_runner(platform: Platform):
+def _make_runner(platform: Platform, extra: dict | None = None):
     from gateway.run import GatewayRunner
 
     config = GatewayConfig(
-        platforms={platform: PlatformConfig(enabled=True)},
+        platforms={platform: PlatformConfig(enabled=True, extra=extra or {})},
     )
     runner = object.__new__(GatewayRunner)
     runner.config = config
@@ -122,7 +122,12 @@ async def test_hook_allow_falls_through_to_auth(monkeypatch):
 
     monkeypatch.setattr("hermes_cli.plugins.invoke_hook", _fake_hook)
 
-    runner, adapter = _make_runner(Platform.WHATSAPP)
+    # WhatsApp silently ignores unauthorized DMs by default (it's usually a
+    # personal number, not a bot account); opt into "pair" explicitly here
+    # so a generated pairing code stays a valid proxy for "auth chain ran".
+    runner, adapter = _make_runner(
+        Platform.WHATSAPP, extra={"unauthorized_dm_behavior": "pair"}
+    )
     runner.pairing_store.generate_code.return_value = "12345"
 
     result = await runner._handle_message(_make_event("hi"))
