@@ -16,6 +16,8 @@ import os
 import signal
 import subprocess
 import sys
+import time
+from types import SimpleNamespace
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -1122,3 +1124,254 @@ class TestWindowsProbesAreWindowless:
         root = Path(__file__).resolve().parents[2]
         source = (root / "gateway" / "status.py").read_text(encoding="utf-8")
         assert "creationflags=windows_hide_flags()" in source
+
+
+# ---------------------------------------------------------------------------
+# Windows hangs: draining a pipe a grandchild still holds open
+# ---------------------------------------------------------------------------
+
+
+class _FakeProc:
+    """Popen stand-in whose exit is controlled by the test."""
+
+    def __init__(self, returncode=None):
+        self.returncode = returncode
+
+    def poll(self):
+        return self.returncode
+
+    def exit(self, code=0):
+        self.returncode = code
+
+
+class TestWindowsPipeDrainDoesNotHang:
+    """The Windows drain loop must stop after the shell exits.
+
+    Before this fix it did a blocking ``os.read`` on the pipe, so any command
+    that left a background process behind (the grandchild inherits the write
+    end) hung the drain thread forever — and the ``stdout.close()`` that ran
+    afterwards yanked the fd out from under it.
+
+    These tests use a real ``os.pipe()`` on Linux and fake only the Windows
+    peek call, so the loop's actual control flow is exercised.
+    """
+
+    @staticmethod
+    def _peek_via_select(read_fd):
+        """Stand-in for PeekNamedPipe, implemented with select on POSIX."""
+        import select as _select
+
+        def _peek(fd):
+            try:
+                ready, _, _ = _select.select([fd], [], [], 0)
+            except (OSError, ValueError):
+                return None
+            if not ready:
+                return 0
+            return 65536  # "something is there" — os.read gives what exists
+
+        return _peek
+
+    def _run_drain(self, monkeypatch, read_fd, proc, **kwargs):
+        import codecs
+        import threading
+
+        from tools.environments import base
+
+        monkeypatch.setattr(
+            base, "windows_pipe_bytes_available", self._peek_via_select(read_fd)
+        )
+        chunks: list[str] = []
+        decoder = codecs.getincrementaldecoder("utf-8")("replace")
+        thread = threading.Thread(
+            target=base._drain_pipe_windows,
+            args=(read_fd, proc, chunks, decoder),
+            kwargs=kwargs,
+            daemon=True,
+        )
+        thread.start()
+        return thread, chunks
+
+    def test_stops_after_child_exits_even_if_pipe_stays_open(self, monkeypatch):
+        """The regression: a grandchild holding the write end must not hang us."""
+        read_fd, write_fd = os.pipe()
+        grandchild_keeps_it_open = write_fd  # never closed during this test
+        proc = _FakeProc()
+        try:
+            thread, chunks = self._run_drain(
+                monkeypatch, read_fd, proc, poll_interval=0.01
+            )
+            os.write(grandchild_keeps_it_open, b"hello from the command\n")
+            proc.exit(0)
+            thread.join(timeout=5)
+            assert not thread.is_alive(), (
+                "drain thread hung on a pipe the child's descendant still holds"
+            )
+            assert "hello from the command" in "".join(chunks)
+        finally:
+            os.close(write_fd)
+            os.close(read_fd)
+
+    def test_keeps_draining_while_child_runs(self, monkeypatch):
+        read_fd, write_fd = os.pipe()
+        proc = _FakeProc()
+        try:
+            thread, chunks = self._run_drain(
+                monkeypatch, read_fd, proc, poll_interval=0.01
+            )
+            for i in range(5):
+                os.write(write_fd, f"line {i}\n".encode())
+                time.sleep(0.02)
+            assert thread.is_alive(), "drain must not stop while the child runs"
+            proc.exit(0)
+            thread.join(timeout=5)
+            output = "".join(chunks)
+            for i in range(5):
+                assert f"line {i}" in output
+        finally:
+            os.close(write_fd)
+            os.close(read_fd)
+
+    def test_broken_pipe_is_treated_as_eof(self, monkeypatch):
+        """Peek returning None (write end gone) must end the loop immediately."""
+        from tools.environments import base
+
+        monkeypatch.setattr(base, "windows_pipe_bytes_available", lambda fd: None)
+        import codecs
+
+        chunks: list[str] = []
+        decoder = codecs.getincrementaldecoder("utf-8")("replace")
+        # Never-exiting process: only the None from peek can end this.
+        base._drain_pipe_windows(-1, _FakeProc(), chunks, decoder, poll_interval=0.01)
+
+    def test_multibyte_character_split_across_reads_survives(self, monkeypatch):
+        read_fd, write_fd = os.pipe()
+        proc = _FakeProc()
+        try:
+            thread, chunks = self._run_drain(
+                monkeypatch, read_fd, proc, poll_interval=0.01
+            )
+            encoded = "çığ".encode("utf-8")
+            for byte in encoded:
+                os.write(write_fd, bytes([byte]))
+                time.sleep(0.005)
+            proc.exit(0)
+            thread.join(timeout=5)
+            assert "".join(chunks) == "çığ"
+        finally:
+            os.close(write_fd)
+            os.close(read_fd)
+
+    def test_peek_helper_is_none_on_posix(self):
+        """Documented contract: the helper is Windows-only, None elsewhere."""
+        from hermes_cli._subprocess_compat import windows_pipe_bytes_available
+
+        assert windows_pipe_bytes_available(0) is None
+
+    def test_reconcile_drains_the_tail_on_windows(self, monkeypatch):
+        """_reconcile_local_exit used to skip the drain entirely on Windows."""
+        from tools import process_registry as pr
+
+        read_fd, write_fd = os.pipe()
+        try:
+            os.write(write_fd, b"tail output\n")
+            proc = _FakeProc(returncode=0)
+            proc.stdout = os.fdopen(read_fd, "rb")
+            session = pr.ProcessSession(id="proc_tail", command="whatever")
+            session.process = proc
+
+            registry = pr.ProcessRegistry()
+            registry._running[session.id] = session
+            monkeypatch.setattr(pr, "_IS_WINDOWS", True)
+            monkeypatch.setattr(
+                pr, "windows_pipe_bytes_available", lambda fd: len(b"tail output\n")
+            )
+
+            registry._reconcile_local_exit(session)
+
+            assert session.exited is True
+            assert "tail output" in session.output_buffer
+        finally:
+            os.close(write_fd)
+
+
+# ---------------------------------------------------------------------------
+# Windows freezes: the gateway PID scan used to shell out to PowerShell
+# ---------------------------------------------------------------------------
+
+
+class TestGatewayScanUsesPsutil:
+    """On Windows 11 wmic is gone, so every scan fell through to
+    ``Get-CimInstance Win32_Process`` — a full WMI walk plus PowerShell
+    startup, seconds per call, on a path that runs during status/start/stop."""
+
+    def test_iter_process_cmdlines_sees_this_process(self):
+        from hermes_cli import gateway
+
+        rows = gateway._iter_process_cmdlines()
+        assert rows is not None
+        assert any(pid == os.getpid() for pid, _ in rows)
+
+    def test_windows_scan_does_not_spawn_a_probe(self, monkeypatch):
+        from hermes_cli import gateway
+
+        monkeypatch.setattr(gateway, "is_windows", lambda: True)
+        monkeypatch.setattr(
+            gateway,
+            "_iter_process_cmdlines",
+            lambda: [(4242, "python -m hermes_cli.main gateway")],
+        )
+
+        def _boom(*args, **kwargs):  # pragma: no cover - must not run
+            raise AssertionError("the PID scan must not shell out on Windows")
+
+        monkeypatch.setattr(gateway.subprocess, "run", _boom)
+        monkeypatch.setattr(gateway, "_get_ancestor_pids", lambda: set())
+
+        assert gateway._scan_gateway_pids(set(), all_profiles=True) == [4242]
+
+    def test_psutil_path_still_filters_venv_launcher_stubs(self, monkeypatch):
+        """The early return must not skip the shared post-processing."""
+        from hermes_cli import gateway
+
+        monkeypatch.setattr(gateway, "is_windows", lambda: True)
+        monkeypatch.setattr(
+            gateway,
+            "_iter_process_cmdlines",
+            lambda: [
+                (100, "pythonw -m hermes_cli.main gateway"),
+                (200, "pythonw -m hermes_cli.main gateway"),
+            ],
+        )
+        monkeypatch.setattr(gateway, "_get_ancestor_pids", lambda: set())
+        # 100 is the launcher stub: it is the parent of 200.
+        monkeypatch.setattr(
+            gateway,
+            "_filter_venv_launcher_stubs",
+            lambda pids: [p for p in pids if p != 100],
+        )
+
+        assert gateway._scan_gateway_pids(set(), all_profiles=True) == [200]
+
+    def test_falls_back_to_shell_probe_when_psutil_is_unavailable(self, monkeypatch):
+        from hermes_cli import gateway
+
+        monkeypatch.setattr(gateway, "is_windows", lambda: True)
+        monkeypatch.setattr(gateway, "_iter_process_cmdlines", lambda: None)
+        monkeypatch.setattr(gateway, "_get_ancestor_pids", lambda: set())
+        monkeypatch.setattr(gateway.shutil, "which", lambda name: rf"C:\{name}.exe")
+
+        calls = []
+
+        def _fake_run(cmd, **kwargs):
+            calls.append(cmd)
+            return SimpleNamespace(
+                returncode=0,
+                stdout="CommandLine=python -m hermes_cli.main gateway\nProcessId=777\n\n",
+                stderr="",
+            )
+
+        monkeypatch.setattr(gateway.subprocess, "run", _fake_run)
+
+        assert gateway._scan_gateway_pids(set(), all_profiles=True) == [777]
+        assert calls, "the wmic/PowerShell fallback must still be reachable"

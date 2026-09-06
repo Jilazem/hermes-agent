@@ -197,9 +197,14 @@ _POWERSHELL_EXTRACT_IMAGE_SCRIPTS = (
 
 
 def _run_powershell(exe: str, script: str, timeout: int) -> subprocess.CompletedProcess:
+    from hermes_cli._subprocess_compat import windows_hide_flags
+
     return subprocess.run(
         [exe, "-NoProfile", "-NonInteractive", "-Command", script],
         capture_output=True, text=True, timeout=timeout,
+        # Native Windows: a clipboard probe should not blink a console window
+        # over the user's terminal.  No-op from WSL, where the flag is 0.
+        creationflags=windows_hide_flags(),
     )
 
 

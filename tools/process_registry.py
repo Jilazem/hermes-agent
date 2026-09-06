@@ -42,7 +42,7 @@ import time
 import uuid
 
 _IS_WINDOWS = platform.system() == "Windows"
-from hermes_cli._subprocess_compat import windows_hide_flags
+from hermes_cli._subprocess_compat import windows_hide_flags, windows_pipe_bytes_available
 from tools.environments.local import _find_shell, _resolve_safe_cwd, _sanitize_subprocess_env
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
@@ -904,7 +904,21 @@ class ProcessRegistry:
         # available and we stop.
         drained = ""
         stdout = getattr(proc, "stdout", None)
-        if stdout is not None and not _IS_WINDOWS:
+        if stdout is not None and _IS_WINDOWS:
+            # Windows has no fcntl, but PeekNamedPipe tells us how much is
+            # already buffered so we can read exactly that much and never
+            # block.  Without this the Windows path silently dropped the tail
+            # of every command whose pipe a descendant kept open.
+            try:
+                fd = stdout.fileno()
+                available = windows_pipe_bytes_available(fd)
+                if available:
+                    chunk = os.read(fd, min(available, 1 << 20))
+                    if chunk:
+                        drained = chunk.decode("utf-8", errors="replace") if isinstance(chunk, bytes) else chunk
+            except (OSError, ValueError) as e:
+                logger.debug("Windows pipe drain failed for %s: %s", session.id, e)
+        elif stdout is not None:
             try:
                 import fcntl
                 fd = stdout.fileno()

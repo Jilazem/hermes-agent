@@ -20,6 +20,7 @@ from abc import ABC, abstractmethod
 from pathlib import Path
 from typing import IO, Callable, Protocol
 
+from hermes_cli._subprocess_compat import windows_pipe_bytes_available
 from hermes_constants import get_hermes_home
 from tools.interrupt import is_interrupted
 
@@ -96,6 +97,70 @@ def get_sandbox_dir() -> Path:
 # ---------------------------------------------------------------------------
 # Shared constants and utilities
 # ---------------------------------------------------------------------------
+
+
+def _drain_pipe_windows(
+    fd,
+    proc,
+    output_chunks: list,
+    decoder,
+    *,
+    poll_interval: float = 0.1,
+    idle_cycles_after_exit: int = 3,
+) -> None:
+    """Drain a child's stdout pipe on Windows without ever blocking on it.
+
+    The POSIX drain loop polls with ``select`` so it can stop shortly after
+    the shell exits, instead of blocking on a pipe that a backgrounded
+    *grandchild* still holds open (issue #8340).  ``select`` accepts only
+    sockets on Windows, so that branch used a blocking ``os.read`` and had
+    the exact hang ``select`` exists to prevent: run anything that leaves a
+    process behind and the drain thread never returns.  The command's own
+    result then waited on ``drain_thread.join()``, and the ``stdout.close()``
+    that followed pulled the fd out from under a thread still reading it.
+
+    ``PeekNamedPipe`` gives Windows the same "is there anything to read?"
+    question ``select`` answers on POSIX, so this mirrors the POSIX loop:
+    read what is buffered, and once the child has exited and the pipe has
+    been quiet for ``idle_cycles_after_exit`` polls, stop.
+
+    Bytes are decoded incrementally: a single UTF-8 character can straddle
+    two reads.
+    """
+    idle_after_exit = 0
+    try:
+        while True:
+            available = windows_pipe_bytes_available(fd)
+            if available is None:
+                break  # pipe closed or broken — treat as EOF
+            if available:
+                try:
+                    chunk = os.read(fd, min(available, 65536))
+                except (ValueError, OSError):
+                    break
+                if not chunk:
+                    break
+                output_chunks.append(decoder.decode(chunk))
+                idle_after_exit = 0
+                continue
+            if proc.poll() is not None:
+                # The shell is gone and the pipe was idle for one interval.
+                # Give it a couple more cycles to catch a buffered tail, then
+                # stop — otherwise we wait forever on a grandchild's pipe.
+                idle_after_exit += 1
+                if idle_after_exit >= idle_cycles_after_exit:
+                    break
+            time.sleep(poll_interval)
+    except Exception:
+        pass
+    finally:
+        # Flush any bytes buffered mid-sequence.
+        try:
+            tail = decoder.decode(b"", final=True)
+            if tail:
+                output_chunks.append(tail)
+        except Exception:
+            pass
 
 
 def _pipe_stdin(proc: subprocess.Popen, data: str) -> None:
@@ -526,25 +591,17 @@ class BaseEnvironment(ABC):
 
         def _drain():
             fd = proc.stdout.fileno()
-            # select.select does NOT work on pipe fds on Windows (only sockets).
-            # Use blocking os.read in a daemon thread instead — safe because
-            # EOF arrives promptly when bash exits.
+            # select.select does NOT work on pipe fds on Windows (only sockets),
+            # so the Windows branch polls the pipe with PeekNamedPipe instead.
+            # Same shape as the POSIX loop below — including "stop draining
+            # shortly after bash exits" — because Windows has the identical
+            # grandchild-holds-the-pipe problem (issue #8340).  The previous
+            # blocking os.read() here could never notice bash had exited: the
+            # thread hung for the lifetime of the backgrounded grandchild, and
+            # the ``proc.stdout.close()`` below then yanked the fd out from
+            # under it.
             if os.name == "nt":
-                try:
-                    while True:
-                        chunk = os.read(fd, 4096)
-                        if not chunk:
-                            break
-                        output_chunks.append(decoder.decode(chunk))
-                except (ValueError, OSError):
-                    pass
-                finally:
-                    try:
-                        tail = decoder.decode(b"", final=True)
-                        if tail:
-                            output_chunks.append(tail)
-                    except Exception:
-                        pass
+                _drain_pipe_windows(fd, proc, output_chunks, decoder)
                 return
             idle_after_exit = 0
             try:
