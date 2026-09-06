@@ -761,9 +761,24 @@ def _run_job_script(script_path: str) -> tuple[bool, str]:
         # shutil.which returns None — fall back to a clear error rather
         # than a FileNotFoundError with a confusing "[WinError 2]"
         # traceback.
-        _bash = shutil.which("bash") or (
-            "/bin/bash" if os.path.isfile("/bin/bash") else None
-        )
+        #
+        # On Windows we reuse the terminal tool's resolver instead of a bare
+        # ``shutil.which("bash")``: it honours HERMES_GIT_BASH_PATH, finds the
+        # installer's portable Git, and — critically — refuses to hand back
+        # ``C:\Windows\System32\bash.exe``, the WSL launcher stub that would
+        # otherwise run the job inside a Linux VM where the Windows script
+        # path does not exist.
+        if sys.platform == "win32":
+            try:
+                from tools.environments.local import _find_bash
+
+                _bash = _find_bash()
+            except Exception:
+                _bash = None
+        else:
+            _bash = shutil.which("bash") or (
+                "/bin/bash" if os.path.isfile("/bin/bash") else None
+            )
         if _bash is None:
             return False, (
                 f"Cannot run .sh/.bash script {path.name!r}: bash not found on PATH. "

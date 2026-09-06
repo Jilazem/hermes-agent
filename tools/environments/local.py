@@ -175,6 +175,56 @@ def _sanitize_subprocess_env(base_env: dict | None, extra_env: dict | None = Non
     return sanitized
 
 
+def _is_wsl_bash_shim(path: str) -> bool:
+    """Return True when ``path`` is Windows' WSL launcher rather than a real bash.
+
+    ``C:\\Windows\\System32\\bash.exe`` is not a shell — it is the WSL
+    launcher stub that Windows ships once the "Windows Subsystem for Linux"
+    optional feature is enabled (the default on many Windows 11 boxes).
+    ``shutil.which("bash")`` happily returns it, because System32 is always
+    on PATH while Git for Windows only puts ``cmd\\`` (not ``bin\\``) there.
+
+    Handing that stub to ``Popen([bash, "-lic", cmd], cwd=r"C:\\Users\\me")``
+    starts a *Linux* shell: the Windows cwd is not a valid Linux path, Windows
+    paths in the command do not resolve, and every terminal call fails with a
+    confusing error.  So we skip it and keep looking for a real Git Bash.
+
+    Matching is on the System32 / SysWOW64 / Sysnative directories under
+    ``%SystemRoot%`` so a genuine bash that merely happens to be named
+    ``bash.exe`` elsewhere is never rejected.
+    """
+    if not path or not path.lower().endswith("bash.exe"):
+        return False
+    system_root = os.environ.get("SystemRoot") or os.environ.get("windir") or r"C:\Windows"
+    # normcase (not abspath): on Windows it folds case and slashes, which is
+    # exactly the comparison we want, and it never drags the cwd into a path
+    # that is already absolute.
+    parent = os.path.normcase(os.path.normpath(os.path.dirname(path)))
+    for sysdir in ("System32", "SysWOW64", "Sysnative"):
+        candidate = os.path.normcase(os.path.normpath(os.path.join(system_root, sysdir)))
+        if parent == candidate:
+            return True
+    return False
+
+
+def _which_bash_excluding_wsl() -> str | None:
+    """``shutil.which("bash")`` with the WSL launcher stub filtered out."""
+    found = shutil.which("bash")
+    if found and not _is_wsl_bash_shim(found):
+        return found
+    if not found:
+        return None
+    # System32\bash.exe won the PATH race — walk the remaining PATH entries
+    # by hand so a real Git Bash further down the list still wins.
+    for entry in os.environ.get("PATH", "").split(os.pathsep):
+        if not entry:
+            continue
+        candidate = os.path.join(entry, "bash.exe")
+        if os.path.isfile(candidate) and not _is_wsl_bash_shim(candidate):
+            return candidate
+    return None
+
+
 def _find_bash() -> str:
     """Find bash for command execution."""
     if not _IS_WINDOWS:
@@ -209,17 +259,22 @@ def _find_bash() -> str:
             if os.path.isfile(candidate):
                 return candidate
 
-    found = shutil.which("bash")
-    if found:
-        return found
-
+    # System Git for Windows next.  These are checked BEFORE the generic PATH
+    # lookup (which the Windows guide documents as the last resort) because a
+    # known-good Git Bash beats whatever ``bash.exe`` happens to be on PATH.
     for candidate in (
         os.path.join(os.environ.get("ProgramFiles", r"C:\Program Files"), "Git", "bin", "bash.exe"),
         os.path.join(os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)"), "Git", "bin", "bash.exe"),
-        os.path.join(_local_appdata, "Programs", "Git", "bin", "bash.exe"),
+        os.path.join(_local_appdata, "Programs", "Git", "bin", "bash.exe") if _local_appdata else "",
     ):
         if candidate and os.path.isfile(candidate):
             return candidate
+
+    # Last resort: any bash on PATH (MSYS2, Cygwin, a hand-rolled install).
+    # Never the WSL launcher — see _is_wsl_bash_shim.
+    found = _which_bash_excluding_wsl()
+    if found:
+        return found
 
     raise RuntimeError(
         "Git Bash not found. Hermes Agent requires Git for Windows on Windows.\n"

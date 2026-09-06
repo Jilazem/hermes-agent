@@ -39,6 +39,7 @@ __all__ = [
     "windows_detach_flags",
     "windows_hide_flags",
     "windows_detach_popen_kwargs",
+    "windows_pipe_bytes_available",
 ]
 
 
@@ -173,3 +174,56 @@ def windows_detach_popen_kwargs() -> dict:
     if IS_WINDOWS:
         return {"creationflags": windows_detach_flags()}
     return {"start_new_session": True}
+
+
+# -----------------------------------------------------------------------------
+# Non-blocking pipe reads
+# -----------------------------------------------------------------------------
+
+
+def windows_pipe_bytes_available(fd: int) -> Optional[int]:
+    """Bytes readable from an anonymous-pipe ``fd`` right now, without blocking.
+
+    POSIX code polls a pipe with ``select.select`` before reading, so a reader
+    thread can notice that the child exited and stop instead of blocking
+    forever on a pipe some *grandchild* still holds open.  ``select`` on
+    Windows only accepts sockets, so the Windows branches used a plain
+    blocking ``os.read`` and inherited exactly the hang that ``select`` was
+    there to prevent: background a process from a command (``cmd &``, a dev
+    server, anything that survives the shell) and the reader thread never
+    returns.  The visible symptom is Hermes freezing at the end of a command
+    that has already finished.
+
+    ``PeekNamedPipe`` is the Win32 equivalent — it reports how many bytes are
+    buffered without consuming them, and fails once the write end is gone.
+
+    Returns:
+        The byte count (possibly ``0``) when the pipe is alive, or ``None``
+        when it is closed, broken, or not a pipe at all — callers should
+        treat ``None`` as EOF and stop reading.  Always ``None`` off Windows,
+        where ``select`` is the right tool.
+    """
+    if not IS_WINDOWS:
+        return None
+    try:
+        import ctypes
+        import ctypes.wintypes as wintypes
+        import msvcrt  # type: ignore[import-not-found]
+
+        handle = msvcrt.get_osfhandle(fd)
+        available = wintypes.DWORD(0)
+        ok = ctypes.windll.kernel32.PeekNamedPipe(  # type: ignore[attr-defined]
+            wintypes.HANDLE(handle),
+            None,
+            0,
+            None,
+            ctypes.byref(available),
+            None,
+        )
+        if not ok:
+            # ERROR_BROKEN_PIPE (write end closed) is the normal EOF path;
+            # anything else (bad handle, not a pipe) is equally unreadable.
+            return None
+        return int(available.value)
+    except Exception:
+        return None

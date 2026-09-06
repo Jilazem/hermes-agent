@@ -23,6 +23,8 @@ from hermes_constants import get_hermes_home
 from typing import Any, Optional
 from utils import atomic_json_write
 
+from hermes_cli._subprocess_compat import windows_hide_flags
+
 if sys.platform == "win32":
     import msvcrt
 else:
@@ -86,6 +88,10 @@ def terminate_pid(pid: int, *, force: bool = False) -> None:
                 capture_output=True,
                 text=True,
                 timeout=10,
+                # No console flash when the gateway runs windowless (the
+                # ``schtasks`` autostart entry has no console to inherit, so
+                # every probe would otherwise pop a black box on screen).
+                creationflags=windows_hide_flags(),
             )
         except FileNotFoundError:
             os.kill(pid, signal.SIGTERM)
@@ -109,12 +115,31 @@ def _get_scope_lock_path(scope: str, identity: str) -> Path:
 
 
 def _get_process_start_time(pid: int) -> Optional[int]:
-    """Return the kernel start time for a process when available."""
+    """Return the kernel start time for a process when available.
+
+    Linux reads ``/proc/<pid>/stat`` directly (cheapest, no import cost).
+    Everywhere else — Windows and macOS have no ``/proc`` — we ask psutil,
+    which is a core dependency and reads ``GetProcessTimes`` on Windows.
+    Without this fallback the value was always ``None`` off Linux, which
+    disabled every PID-reuse guard in this module: a recycled PID that
+    happened to match a stale ``gateway.pid`` looked like a live gateway.
+
+    The unit differs per platform (clock ticks on Linux, milliseconds since
+    the epoch elsewhere) and that is fine — the value is only ever compared
+    against another reading of the *same* process on the *same* machine.
+    """
     stat_path = Path(f"/proc/{pid}/stat")
     try:
         # Field 22 in /proc/<pid>/stat is process start time (clock ticks).
         return int(stat_path.read_text(encoding="utf-8").split()[21])
     except (FileNotFoundError, IndexError, PermissionError, ValueError, OSError):
+        pass
+
+    try:
+        import psutil  # type: ignore
+
+        return int(psutil.Process(int(pid)).create_time() * 1000)
+    except Exception:
         return None
 
 
@@ -126,8 +151,16 @@ def get_process_start_time(pid: int) -> Optional[int]:
 def _read_process_cmdline(pid: int) -> Optional[str]:
     """Return the process command line as a space-separated string.
 
-    On Linux, reads /proc/<pid>/cmdline directly.  On macOS and other
-    platforms without /proc, falls back to ``ps -p <pid> -o command=``.
+    On Linux, reads /proc/<pid>/cmdline directly.  Elsewhere it asks psutil
+    (core dependency, works on Windows), and only then falls back to
+    ``ps -p <pid> -o command=``.
+
+    The psutil step is what makes this work on Windows at all: there is no
+    ``/proc`` and no ``ps``, so this used to return ``None`` for every PID.
+    ``_looks_like_gateway_process`` therefore always answered "not a gateway"
+    and the stale-PID logic had to lean on the PID file's own argv — which
+    a recycled PID cannot invalidate.  Same failure mode ``_get_parent_pid``
+    already fixed in ``hermes_cli/gateway.py``.
     """
     cmdline_path = Path(f"/proc/{pid}/cmdline")
     try:
@@ -137,6 +170,24 @@ def _read_process_cmdline(pid: int) -> Optional[str]:
     else:
         if raw:
             return raw.replace(b"\x00", b" ").decode("utf-8", errors="ignore").strip()
+
+    try:
+        import psutil  # type: ignore
+
+        cmdline = psutil.Process(int(pid)).cmdline()
+        if cmdline:
+            return " ".join(cmdline).strip() or None
+    except ImportError:
+        pass
+    except Exception:
+        # NoSuchProcess / AccessDenied / ZombieProcess — fall through to ps,
+        # which may still answer for a process psutil cannot open.
+        pass
+
+    if _IS_WINDOWS:
+        # No ``ps`` on native Windows; spawning it would only cost a failed
+        # CreateProcess (and a console flash under a Scheduled Task).
+        return None
 
     try:
         result = subprocess.run(

@@ -216,8 +216,6 @@ def _augment_path_with_known_tools() -> None:
     if not is_windows():
         return
 
-    import shutil as _shutil
-
     local_appdata = os.environ.get("LOCALAPPDATA", "")
     if not local_appdata:
         return
@@ -249,4 +247,7 @@ def _augment_path_with_known_tools() -> None:
             prepend.append(d)
 
     if prepend:
-        os.environ["PATH"] = os.pathsep.join([*prepend, existing])
+        # Guard against an empty inherited PATH — joining ["dir", ""] would
+        # leave a trailing separator, which Windows resolves as "the current
+        # directory", a subtle way to pick up a stray binary from the cwd.
+        os.environ["PATH"] = os.pathsep.join([*prepend, existing] if existing else prepend)

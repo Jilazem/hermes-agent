@@ -17,6 +17,7 @@ from pathlib import Path
 PROJECT_ROOT = Path(__file__).parent.parent.resolve()
 
 from gateway.status import terminate_pid
+from hermes_cli._subprocess_compat import windows_hide_flags
 from gateway.restart import (
     DEFAULT_GATEWAY_RESTART_DRAIN_TIMEOUT,
     GATEWAY_SERVICE_RESTART_EXIT_CODE,
@@ -283,6 +284,40 @@ def _append_unique_pid(pids: list[int], pid: int | None, exclude_pids: set[int])
     pids.append(pid)
 
 
+def _iter_process_cmdlines() -> list[tuple[int, str]] | None:
+    """Return ``(pid, command line)`` for every visible process, via psutil.
+
+    psutil is a core dependency and reads the process table in-process on
+    every platform, so this replaces a subprocess probe (``wmic`` /
+    ``Get-CimInstance`` / ``ps``) with a plain function call.
+
+    Returns ``None`` when psutil is unavailable, so callers keep their
+    existing shell-out path as a fallback.  Processes that vanish mid-walk or
+    that we may not open are skipped rather than failing the whole scan.
+    """
+    try:
+        import psutil  # type: ignore
+    except ImportError:
+        return None
+
+    rows: list[tuple[int, str]] = []
+    try:
+        for proc in psutil.process_iter(["pid", "cmdline"]):
+            try:
+                info = proc.info
+                cmdline = info.get("cmdline") or []
+                if not cmdline:
+                    continue
+                rows.append((int(info["pid"]), " ".join(cmdline)))
+            except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+                continue
+            except Exception:
+                continue
+    except Exception:
+        return None
+    return rows
+
+
 def _scan_gateway_pids(exclude_pids: set[int], all_profiles: bool = False) -> list[int]:
     """Best-effort process-table scan for gateway PIDs.
 
@@ -330,13 +365,28 @@ def _scan_gateway_pids(exclude_pids: set[int], all_profiles: bool = False) -> li
 
     try:
         if is_windows():
+            # psutil first: it reads the process table in-process, so a status
+            # check costs milliseconds instead of spawning a probe.  This is
+            # the difference between a snappy ``hermes gateway status`` and a
+            # multi-second freeze on Windows 11, where wmic has been removed
+            # and every scan fell through to ``Get-CimInstance Win32_Process``
+            # — a full WMI enumeration plus PowerShell startup, 1-3s each time,
+            # on a code path that also runs during gateway start/stop/restart.
+            rows = _iter_process_cmdlines()
+            if rows is not None:
+                for _pid, _command in rows:
+                    if any(p in _command for p in patterns) and (
+                        all_profiles or _matches_current_profile(_command)
+                    ):
+                        _append_unique_pid(pids, _pid, exclude_pids)
+                return _finalize_scanned_pids(pids)
+
             # Prefer wmic when present (fast, stable output format).  On
             # modern Windows 11 / Win 10 late builds, wmic has been
             # removed as part of the WMIC deprecation — fall back to
             # PowerShell's Get-CimInstance.  Any OSError here (FileNotFoundError
             # on missing wmic) trips the fallback.
             wmic_path = shutil.which("wmic")
-            used_fallback = False
             result = None
             if wmic_path is not None:
                 try:
@@ -347,6 +397,10 @@ def _scan_gateway_pids(exclude_pids: set[int], all_profiles: bool = False) -> li
                         encoding="utf-8",
                         errors="ignore",
                         timeout=10,
+                        # Keep the probe windowless: under the schtasks
+                        # autostart entry there is no console to inherit, so
+                        # each scan would otherwise flash a black box.
+                        creationflags=windows_hide_flags(),
                     )
                 except (OSError, subprocess.TimeoutExpired):
                     result = None
@@ -372,10 +426,10 @@ def _scan_gateway_pids(exclude_pids: set[int], all_profiles: bool = False) -> li
                         encoding="utf-8",
                         errors="ignore",
                         timeout=15,
+                        creationflags=windows_hide_flags(),
                     )
                 except (OSError, subprocess.TimeoutExpired):
                     return []
-                used_fallback = True
             if result.returncode != 0 or result.stdout is None:
                 return []
             current_cmd = ""
@@ -459,20 +513,28 @@ def _scan_gateway_pids(exclude_pids: set[int], all_profiles: bool = False) -> li
     except (OSError, subprocess.TimeoutExpired):
         return []
 
-    # Windows-specific: collapse venv launcher stubs.  A venv-built
-    # ``pythonw.exe`` in ``<venv>/Scripts/`` is a ~100 KB launcher exe
-    # that spawns the base Python (e.g. ``C:\Program Files\Python311\
-    # pythonw.exe``) with the same command line, preserving the venv's
-    # ``pyvenv.cfg`` context.  This is standard Windows CPython venv
-    # behaviour — BUT it means every gateway run produces two pythonw
-    # PIDs with identical command lines (one launcher stub, one actual
-    # interpreter) which is confusing in ``gateway status`` output.
-    # Filter the stub: if a PID in our result is the PARENT of another
-    # PID in our result, and both are pythonw.exe, the parent is the
-    # launcher stub — drop it, keep the child.
-    if is_windows() and len(pids) > 1:
-        pids = _filter_venv_launcher_stubs(pids)
+    return _finalize_scanned_pids(pids)
 
+
+def _finalize_scanned_pids(pids: list[int]) -> list[int]:
+    r"""Post-process a raw process-table scan into the final PID list.
+
+    Windows-specific: collapse venv launcher stubs.  A venv-built
+    ``pythonw.exe`` in ``<venv>/Scripts/`` is a ~100 KB launcher exe that
+    spawns the base Python (e.g. ``C:\Program Files\Python311\pythonw.exe``)
+    with the same command line, preserving the venv's ``pyvenv.cfg`` context.
+    This is standard Windows CPython venv behaviour — BUT it means every
+    gateway run produces two pythonw PIDs with identical command lines (one
+    launcher stub, one actual interpreter) which is confusing in
+    ``gateway status`` output.  Filter the stub: if a PID in our result is the
+    PARENT of another PID in our result, and both are pythonw.exe, the parent
+    is the launcher stub — drop it, keep the child.
+
+    Shared by both scan paths (psutil and the wmic/PowerShell fallback) so
+    neither can skip the filter.
+    """
+    if is_windows() and len(pids) > 1:
+        return _filter_venv_launcher_stubs(pids)
     return pids
 
 
