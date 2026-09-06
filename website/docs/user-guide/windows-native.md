@@ -84,12 +84,14 @@ Hermes's terminal tool runs commands through **Git Bash**, same strategy Claude 
 Resolution order for `bash.exe`:
 
 1. `HERMES_GIT_BASH_PATH` environment variable if set.
-2. `%LOCALAPPDATA%\hermes\git\usr\bin\bash.exe` (installer-managed PortableGit).
-3. `%LOCALAPPDATA%\hermes\git\bin\bash.exe` (older Git-for-Windows layout).
+2. `%LOCALAPPDATA%\hermes\git\bin\bash.exe` (installer-managed PortableGit).
+3. `%LOCALAPPDATA%\hermes\git\usr\bin\bash.exe` (MinGit layout, checked second).
 4. System Git-for-Windows install (`%ProgramFiles%\Git\bin\bash.exe`, etc.).
 5. MSYS2, Cygwin, or any `bash.exe` on PATH as a last resort.
 
 The installer sets `HERMES_GIT_BASH_PATH` explicitly so fresh PowerShell sessions don't have to re-discover. Override it if you want Hermes to use a specific bash — for example, your system Git Bash or a WSL-hosted bash via a symlink.
+
+**Pitfall:** `C:\Windows\System32\bash.exe` is *not* a shell — it is the WSL launcher stub Windows ships once the "Windows Subsystem for Linux" optional feature is enabled. Because System32 is always on PATH (and Git for Windows only puts `cmd\` there), a naive `where bash` finds it first. Hermes skips it deliberately at every step of the list above: running the terminal tool through it would start a *Linux* shell with a Windows working directory, and every command would fail with a confusing path error. If you genuinely want Hermes to run inside WSL, use the [WSL2 guide](./windows-wsl-quickstart.md) rather than pointing `HERMES_GIT_BASH_PATH` at the stub.
 
 **Pitfall:** MinGit's layout is different from the full Git-for-Windows installer — bash lives under `usr\bin\bash.exe`, not `bin\bash.exe`. Hermes checks both. If you're manually unpacking a MinGit zip, make sure you pick the **non-busybox** variant (`MinGit-*-64-bit.zip`, not `MinGit-*-busybox*.zip`) — busybox builds ship `ash` instead of `bash` and most coreutils are missing.
 

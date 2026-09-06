@@ -34,6 +34,7 @@ import logging
 import os
 import platform
 import shlex
+import shutil
 import signal
 import subprocess
 import threading
@@ -41,6 +42,7 @@ import time
 import uuid
 
 _IS_WINDOWS = platform.system() == "Windows"
+from hermes_cli._subprocess_compat import windows_hide_flags
 from tools.environments.local import _find_shell, _resolve_safe_cwd, _sanitize_subprocess_env
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
@@ -429,28 +431,60 @@ class ProcessRegistry:
         return session
 
     @staticmethod
-    def _terminate_host_pid(pid: int) -> None:
-        """Terminate a host-visible PID without requiring the original process handle."""
-        if _IS_WINDOWS:
-            os.kill(pid, signal.SIGTERM)
-            return
+    def _terminate_process_tree(pid: int) -> None:
+        """Terminate ``pid`` and every descendant, on every platform.
 
+        psutil is a core dependency and its ``children(recursive=True)`` /
+        ``terminate()`` work identically on Windows (TerminateProcess) and
+        POSIX (SIGTERM), so the tree walk is NOT POSIX-only.
+
+        This used to short-circuit to a bare ``os.kill(pid, SIGTERM)`` on
+        Windows, which maps to ``TerminateProcess`` for that one PID.  Every
+        background command runs as ``bash.exe -lic "<command>"``, so the real
+        command is a *grandchild*: killing only the direct child left the
+        actual workload (npm, python, a dev server holding a port) running
+        with nobody tracking it.  ``taskkill /T`` is the Windows fallback
+        because it is the only stdlib-free way to kill a tree.
+        """
         import psutil
+
         try:
             parent = psutil.Process(pid)
             for child in parent.children(recursive=True):
                 try:
                     child.terminate()
-                except psutil.NoSuchProcess:
+                except (psutil.NoSuchProcess, psutil.AccessDenied):
                     pass
             parent.terminate()
+            return
         except psutil.NoSuchProcess:
             return
-        except (OSError, PermissionError):
-            try:
-                os.kill(pid, signal.SIGTERM)
-            except (OSError, ProcessLookupError, PermissionError):
-                pass
+        except (OSError, PermissionError, psutil.AccessDenied):
+            pass
+
+        # psutil could not do it (access denied, or a platform quirk).
+        if _IS_WINDOWS:
+            taskkill = shutil.which("taskkill")
+            if taskkill:
+                try:
+                    subprocess.run(
+                        [taskkill, "/PID", str(pid), "/T", "/F"],
+                        capture_output=True,
+                        timeout=10,
+                        creationflags=windows_hide_flags(),
+                    )
+                    return
+                except (OSError, subprocess.TimeoutExpired):
+                    pass
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except (OSError, ProcessLookupError, PermissionError):
+            pass
+
+    @classmethod
+    def _terminate_host_pid(cls, pid: int) -> None:
+        """Terminate a host-visible PID without requiring the original process handle."""
+        cls._terminate_process_tree(pid)
 
     # ----- Spawn -----
 
@@ -1065,22 +1099,12 @@ class ProcessRegistry:
                     if session.pid:
                         os.kill(session.pid, signal.SIGTERM)
             elif session.process:
-                # Local process -- kill the process tree
+                # Local process -- kill the process tree.  The direct child is
+                # the shell (``bash -lic "<command>"``); the command itself is
+                # a grandchild, so terminating only ``session.process`` would
+                # orphan the real workload.  True on Windows as much as POSIX.
                 try:
-                    if _IS_WINDOWS:
-                        session.process.terminate()
-                    else:
-                        import psutil
-                        try:
-                            parent = psutil.Process(session.process.pid)
-                            for child in parent.children(recursive=True):
-                                try:
-                                    child.terminate()
-                                except psutil.NoSuchProcess:
-                                    pass
-                            parent.terminate()
-                        except psutil.NoSuchProcess:
-                            pass
+                    self._terminate_process_tree(session.process.pid)
                 except (ProcessLookupError, PermissionError):
                     session.process.kill()
             elif session.env_ref and session.pid:

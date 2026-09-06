@@ -871,3 +871,254 @@ class TestGatewayDetachedWatcherWindowsFlags:
         assert 'if sys.platform == "win32":' in source
         # Windows branch uses windows_detach_popen_kwargs
         assert "windows_detach_popen_kwargs" in source
+
+
+# ---------------------------------------------------------------------------
+# Git Bash resolution must never pick the WSL launcher
+# ---------------------------------------------------------------------------
+
+
+class TestGitBashResolutionSkipsWslShim:
+    """``C:\\Windows\\System32\\bash.exe`` is the WSL launcher, not a shell.
+
+    ``shutil.which("bash")`` returns it on any Windows 11 box with the WSL
+    optional feature enabled, because System32 is always on PATH while Git
+    for Windows only puts ``cmd\\`` there.  Running the terminal tool through
+    it starts a Linux shell with a Windows cwd — every command fails.
+
+    These tests run on Linux CI, so they use a POSIX-shaped ``%SystemRoot%``
+    and build every path with ``os.path.join`` — the same calls the code
+    makes, which resolve to ``ntpath`` on a real Windows box.
+    """
+
+    SYSTEM_ROOT = os.path.join(os.sep + "fake", "Windows")
+
+    def _system32(self, name="bash.exe"):
+        return os.path.join(self.SYSTEM_ROOT, "System32", name)
+
+    def test_system32_bash_is_recognised_as_wsl_shim(self, monkeypatch):
+        from tools.environments import local
+
+        monkeypatch.setenv("SystemRoot", self.SYSTEM_ROOT)
+        assert local._is_wsl_bash_shim(self._system32())
+        assert local._is_wsl_bash_shim(
+            os.path.join(self.SYSTEM_ROOT, "SysWOW64", "bash.exe")
+        )
+        assert local._is_wsl_bash_shim(
+            os.path.join(self.SYSTEM_ROOT, "Sysnative", "bash.exe")
+        )
+
+    def test_real_git_bash_is_not_flagged(self, monkeypatch):
+        from tools.environments import local
+
+        monkeypatch.setenv("SystemRoot", self.SYSTEM_ROOT)
+        assert not local._is_wsl_bash_shim(
+            os.path.join("C:", "Program Files", "Git", "bin", "bash.exe")
+        )
+        assert not local._is_wsl_bash_shim("/usr/bin/bash")
+        assert not local._is_wsl_bash_shim("")
+        # A non-bash binary sitting in System32 is none of our business.
+        assert not local._is_wsl_bash_shim(self._system32("where.exe"))
+
+    def test_which_skips_wsl_and_finds_real_bash_further_down_path(self, monkeypatch):
+        from tools.environments import local
+
+        real_bash = os.path.join(os.sep + "msys64", "usr", "bin", "bash.exe")
+        monkeypatch.setenv("SystemRoot", self.SYSTEM_ROOT)
+        monkeypatch.setenv(
+            "PATH",
+            os.pathsep.join(
+                [os.path.join(self.SYSTEM_ROOT, "System32"), os.path.dirname(real_bash)]
+            ),
+        )
+        monkeypatch.setattr(local.shutil, "which", lambda name: self._system32())
+        monkeypatch.setattr(
+            local.os.path, "isfile", lambda p: p in {self._system32(), real_bash}
+        )
+        assert local._which_bash_excluding_wsl() == real_bash
+
+    def test_which_returns_none_when_only_wsl_shim_exists(self, monkeypatch):
+        from tools.environments import local
+
+        monkeypatch.setenv("SystemRoot", self.SYSTEM_ROOT)
+        monkeypatch.setenv("PATH", os.path.join(self.SYSTEM_ROOT, "System32"))
+        monkeypatch.setattr(local.shutil, "which", lambda name: self._system32())
+        monkeypatch.setattr(local.os.path, "isfile", lambda p: p == self._system32())
+        assert local._which_bash_excluding_wsl() is None
+
+    def test_find_bash_prefers_system_git_over_path_bash(self, monkeypatch):
+        """Documented order: portable Git → system Git → generic PATH bash."""
+        from tools.environments import local
+
+        program_files = os.path.join(os.sep + "fake", "Program Files")
+        system_git = os.path.join(program_files, "Git", "bin", "bash.exe")
+        monkeypatch.setattr(local, "_IS_WINDOWS", True)
+        monkeypatch.setenv("SystemRoot", self.SYSTEM_ROOT)
+        monkeypatch.delenv("HERMES_GIT_BASH_PATH", raising=False)
+        monkeypatch.setenv("LOCALAPPDATA", os.path.join(os.sep + "fake", "AppData"))
+        monkeypatch.setenv("ProgramFiles", program_files)
+        monkeypatch.setattr(local.shutil, "which", lambda name: self._system32())
+        monkeypatch.setattr(local.os.path, "isfile", lambda p: p == system_git)
+
+        assert local._find_bash() == system_git
+
+    def test_find_bash_raises_rather_than_returning_wsl_shim(self, monkeypatch):
+        from tools.environments import local
+
+        monkeypatch.setattr(local, "_IS_WINDOWS", True)
+        monkeypatch.setenv("SystemRoot", self.SYSTEM_ROOT)
+        monkeypatch.delenv("HERMES_GIT_BASH_PATH", raising=False)
+        monkeypatch.setenv("LOCALAPPDATA", os.path.join(os.sep + "fake", "AppData"))
+        monkeypatch.setenv("ProgramFiles", os.path.join(os.sep + "fake", "Program Files"))
+        monkeypatch.setenv("PATH", os.path.join(self.SYSTEM_ROOT, "System32"))
+        monkeypatch.setattr(local.shutil, "which", lambda name: self._system32())
+        monkeypatch.setattr(local.os.path, "isfile", lambda p: p == self._system32())
+
+        with pytest.raises(RuntimeError, match="Git Bash not found"):
+            local._find_bash()
+
+    def test_explicit_override_still_wins(self, monkeypatch, tmp_path):
+        """HERMES_GIT_BASH_PATH is the user's explicit choice — never second-guessed."""
+        from tools.environments import local
+
+        explicit = tmp_path / "bash.exe"
+        explicit.write_text("", encoding="utf-8")
+        monkeypatch.setattr(local, "_IS_WINDOWS", True)
+        monkeypatch.setenv("HERMES_GIT_BASH_PATH", str(explicit))
+        assert local._find_bash() == str(explicit)
+
+    def test_cron_scheduler_routes_windows_through_find_bash(self):
+        root = Path(__file__).resolve().parents[2]
+        source = (root / "cron" / "scheduler.py").read_text(encoding="utf-8")
+        assert "from tools.environments.local import _find_bash" in source, (
+            "cron.scheduler must reuse the Git Bash resolver on Windows so it "
+            "cannot launch scripts through the WSL bash shim"
+        )
+
+
+# ---------------------------------------------------------------------------
+# gateway.status process introspection on Windows (no /proc, no ps)
+# ---------------------------------------------------------------------------
+
+
+class _NoProcPath:
+    """Path stand-in whose /proc reads always fail (simulates Windows)."""
+
+    def __init__(self, value):
+        self._value = str(value)
+
+    def read_bytes(self):
+        raise FileNotFoundError(self._value)
+
+    def read_text(self, *args, **kwargs):
+        raise FileNotFoundError(self._value)
+
+
+class TestGatewayStatusUsesPsutilOffLinux:
+    """Windows has neither ``/proc`` nor ``ps``; psutil is the only oracle."""
+
+    def test_read_process_cmdline_falls_back_to_psutil(self, monkeypatch):
+        from gateway import status
+
+        monkeypatch.setattr(status, "Path", _NoProcPath)
+        cmdline = status._read_process_cmdline(os.getpid())
+        assert cmdline, "psutil must answer when /proc is unavailable"
+        assert "python" in cmdline.lower() or "pytest" in cmdline.lower()
+
+    def test_read_process_cmdline_does_not_shell_out_to_ps_on_windows(self, monkeypatch):
+        from gateway import status
+
+        monkeypatch.setattr(status, "Path", _NoProcPath)
+        monkeypatch.setattr(status, "_IS_WINDOWS", True)
+
+        def _boom(*args, **kwargs):  # pragma: no cover - must not run
+            raise AssertionError("ps must never be spawned on Windows")
+
+        monkeypatch.setattr(status.subprocess, "run", _boom)
+        # A PID that psutil cannot resolve must return None, not spawn ps.
+        assert status._read_process_cmdline(0x7FFFFFFF) is None
+
+    def test_start_time_falls_back_to_psutil(self, monkeypatch):
+        from gateway import status
+
+        monkeypatch.setattr(status, "Path", _NoProcPath)
+        start = status._get_process_start_time(os.getpid())
+        assert isinstance(start, int) and start > 0, (
+            "PID-reuse detection needs a start time on Windows/macOS too"
+        )
+        # Stable across reads — it identifies this exact process incarnation.
+        assert start == status._get_process_start_time(os.getpid())
+
+    def test_start_time_none_for_dead_pid(self, monkeypatch):
+        from gateway import status
+
+        monkeypatch.setattr(status, "Path", _NoProcPath)
+        assert status._get_process_start_time(0x7FFFFFFF) is None
+
+
+# ---------------------------------------------------------------------------
+# Background process kill must reach the whole tree on Windows
+# ---------------------------------------------------------------------------
+
+
+class TestProcessTreeKillOnWindows:
+    """``Popen.terminate()`` on Windows kills one PID.
+
+    Background commands run as ``bash -lic "<cmd>"``, so the workload is a
+    grandchild — a single-PID kill leaves it running untracked.
+    """
+
+    def test_terminate_host_pid_delegates_to_tree_kill(self, monkeypatch):
+        from tools.process_registry import ProcessRegistry
+
+        seen = []
+        monkeypatch.setattr(
+            ProcessRegistry, "_terminate_process_tree", staticmethod(seen.append)
+        )
+        ProcessRegistry._terminate_host_pid(4321)
+        assert seen == [4321]
+
+    def test_kill_uses_tree_kill_for_local_sessions(self, monkeypatch):
+        from tools.process_registry import ProcessRegistry, ProcessSession
+
+        registry = ProcessRegistry()
+        session = ProcessSession(id="proc_test", command="sleep 100")
+        session.process = MagicMock()
+        session.process.pid = 9876
+        session.pid = 9876
+        registry._running[session.id] = session
+
+        seen = []
+        monkeypatch.setattr(
+            ProcessRegistry, "_terminate_process_tree", staticmethod(seen.append)
+        )
+        result = registry.kill_process(session.id)
+
+        assert result["status"] == "killed"
+        assert seen == [9876], "kill() must terminate the whole tree, not just bash"
+        session.process.terminate.assert_not_called()
+
+    def test_no_windows_single_pid_shortcut_left_in_source(self):
+        root = Path(__file__).resolve().parents[2]
+        source = (root / "tools" / "process_registry.py").read_text(encoding="utf-8")
+        assert "if _IS_WINDOWS:\n            os.kill(pid, signal.SIGTERM)" not in source
+        assert "if _IS_WINDOWS:\n                        session.process.terminate()" not in source
+
+
+# ---------------------------------------------------------------------------
+# Windowless probes (gateway autostart has no console to inherit)
+# ---------------------------------------------------------------------------
+
+
+class TestWindowsProbesAreWindowless:
+    def test_gateway_pid_scan_hides_console(self):
+        root = Path(__file__).resolve().parents[2]
+        source = (root / "hermes_cli" / "gateway.py").read_text(encoding="utf-8")
+        assert source.count("creationflags=windows_hide_flags()") >= 2, (
+            "both the wmic and the PowerShell fallback probe must be windowless"
+        )
+
+    def test_taskkill_hides_console(self):
+        root = Path(__file__).resolve().parents[2]
+        source = (root / "gateway" / "status.py").read_text(encoding="utf-8")
+        assert "creationflags=windows_hide_flags()" in source

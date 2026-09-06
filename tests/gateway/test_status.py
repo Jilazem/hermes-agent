@@ -364,8 +364,8 @@ class TestTerminatePid:
         calls = []
         monkeypatch.setattr(status, "_IS_WINDOWS", True)
 
-        def fake_run(cmd, capture_output=False, text=False, timeout=None):
-            calls.append((cmd, capture_output, text, timeout))
+        def fake_run(cmd, capture_output=False, text=False, timeout=None, **kwargs):
+            calls.append((cmd, capture_output, text, timeout, kwargs))
             return SimpleNamespace(returncode=0, stdout="", stderr="")
 
         monkeypatch.setattr(status.subprocess, "run", fake_run)
@@ -373,7 +373,15 @@ class TestTerminatePid:
         status.terminate_pid(123, force=True)
 
         assert calls == [
-            (["taskkill", "/PID", "123", "/T", "/F"], True, True, 10)
+            (
+                ["taskkill", "/PID", "123", "/T", "/F"],
+                True,
+                True,
+                10,
+                # Windowless so the schtasks-launched gateway (no console to
+                # inherit) doesn't flash a black box on every force-kill.
+                {"creationflags": status.windows_hide_flags()},
+            )
         ]
 
     def test_force_falls_back_to_sigterm_when_taskkill_missing(self, monkeypatch):
